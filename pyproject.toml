@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.129.0",
+    "matplotlib>=3.9.0",
     "nibabel>=5.3.3",
     "numpy>=2.4.2",
     "pillow>=12.1.1",
