@@ -1,7 +1,9 @@
 import argparse
 import asyncio
 import io
+import socket
 import sys
+import time
 import threading
 import webbrowser
 from collections import OrderedDict
@@ -540,8 +542,8 @@ def get_ui():
             --highlight: #000; --canvas-border: #999;
         }
         body { background: var(--bg); color: var(--text); font-family: monospace; display: flex; flex-direction: column; align-items: center; padding-top: 20px; margin: 0; }
-        #info { margin-bottom: 20px; font-size: 16px; white-space: pre-wrap; text-align: left; background: var(--surface); padding: 15px; border-radius: 8px; border: 1px solid var(--border); width: 600px; }
-        canvas { border: 1px solid var(--canvas-border); image-rendering: pixelated; }
+        #info { margin-bottom: 20px; font-size: 16px; white-space: pre-wrap; text-align: left; background: var(--surface); padding: 15px; border-radius: 8px; border: 1px solid var(--border); width: fit-content; }
+        canvas { border: 1px solid var(--canvas-border); image-rendering: pixelated; outline: none; cursor: crosshair; }
         .highlight { color: var(--highlight); font-weight: bold; }
         .muted { color: var(--muted); }
         #status { margin-top: 8px; font-size: 13px; color: var(--muted); min-height: 1.2em; }
@@ -565,7 +567,11 @@ def get_ui():
 </head>
 <body>
     <div id="info">Connecting...</div>
-    <canvas id="viewer"></canvas>
+    <canvas id="viewer" tabindex="0"></canvas>
+    <!-- Hidden textarea: VS Code passes all keys (including arrows) to focused text inputs,
+         unlike other focusable elements where it intercepts navigation keys. -->
+    <textarea id="keyboard-sink" autocomplete="off" autocorrect="off" spellcheck="false"
+              style="position:fixed;top:-1px;left:-1px;width:1px;height:1px;opacity:0;border:none;padding:0;margin:0;resize:none;overflow:hidden;"></textarea>
     <div id="status"></div>
     <div id="toast"></div>
     <div id="preload-status"></div>
@@ -583,6 +589,7 @@ def get_ui():
 <span class="key">t</span>  toggle dark / light theme
 <span class="key">s</span>  save screenshot (PNG)
 <span class="key">g</span>  save GIF of current slice dim
+<span class="key">+ / -</span>  zoom in / out
 <span class="key">scroll</span>  scroll through slices
 <span class="key">?</span>  toggle this help</div>
     </div>
@@ -613,13 +620,17 @@ def get_ui():
         // Toast state
         let toastTimer = null;
 
+        // Zoom state
+        let userZoom = 0.6;
+
         const canvas = document.getElementById('viewer');
         const ctx = canvas.getContext('2d');
+        const sink = document.getElementById('keyboard-sink');
 
         function scaleCanvas(w, h) {
             const maxW = window.innerWidth * 0.95;
             const maxH = window.innerHeight * 0.70;
-            const scale = Math.min(maxW / w, maxH / h);
+            const scale = Math.min(maxW / w, maxH / h) * userZoom;
             canvas.style.width  = Math.round(w * scale) + 'px';
             canvas.style.height = Math.round(h * scale) + 'px';
         }
@@ -644,6 +655,7 @@ def get_ui():
             ws.onopen = () => {
                 wsReady = true;
                 setStatus('');
+                sink.focus();
                 updateView();
             };
 
@@ -788,10 +800,27 @@ def get_ui():
 
         const helpOverlay = document.getElementById('help-overlay');
 
-        window.addEventListener('keydown', (e) => {
+        // Re-focus the sink whenever the user clicks anywhere in the viewer.
+        // The hidden textarea trick: VS Code passes all key events (including arrow keys
+        // and h/l which it normally swallows for notebook navigation) to focused text
+        // inputs, because it assumes those need full keyboard access for cursor movement.
+        canvas.addEventListener('click', () => sink.focus());
+        document.addEventListener('click', () => sink.focus());
+
+        sink.addEventListener('keydown', (e) => {
+            e.preventDefault();            // stop browser default (e.g. textarea scrolling)
+            e.stopImmediatePropagation();  // stop other handlers
             if (e.key === '?') { helpOverlay.classList.toggle('visible'); return; }
             if (e.key === 'Escape') { helpOverlay.classList.remove('visible'); return; }
-            if (e.key === 'z') {
+            if (e.key === '+' || e.key === '=') {
+                userZoom = Math.min(userZoom * 1.02, 8.0);
+                scaleCanvas(canvas.width, canvas.height);
+                showToast(`zoom: ${Math.round(userZoom * 100)}%`);
+            } else if (e.key === '-') {
+                userZoom = Math.max(userZoom / 1.02, 0.1);
+                scaleCanvas(canvas.width, canvas.height);
+                showToast(`zoom: ${Math.round(userZoom * 100)}%`);
+            } else if (e.key === 'z') {
                 if (dim_z >= 0) {
                     // Exit z-mode: restore dim_z back as the scroll dim
                     current_slice_dim = dim_z;
@@ -853,7 +882,7 @@ def get_ui():
             }
         });
 
-        helpOverlay.addEventListener('click', () => helpOverlay.classList.remove('visible'));
+        helpOverlay.addEventListener('click', () => { helpOverlay.classList.remove('visible'); sink.focus(); });
 
         window.addEventListener('wheel', (e) => {
             e.preventDefault();
@@ -886,9 +915,24 @@ def _in_jupyter() -> bool:
         from IPython import get_ipython
 
         shell = get_ipython()
-        return shell is not None and hasattr(shell, "kernel")
+        if shell is None:
+            return False
+        # ipykernel is used by Jupyter notebook, JupyterLab, and VS Code
+        # interactive window — all kernel-based environments.
+        return "ipykernel" in type(shell).__module__
     except ImportError:
         return False
+
+
+def _wait_for_port(port: int, timeout: float = 10.0) -> None:
+    """Block until the local TCP port is accepting connections."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                return
+        except OSError:
+            time.sleep(0.05)
 
 
 async def _serve_background(port: int):
@@ -945,15 +989,17 @@ def view(data, port: int = 8123, inline: bool | None = None, height: int = 750):
     if inline:
         # Start a background server the first time (or when the port changes).
         if _jupyter_server_port != port:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.ensure_future(_serve_background(port))
-            else:
-                # Fallback: daemon thread wrapping its own event loop.
-                threading.Thread(
-                    target=lambda: asyncio.run(_serve_background(port)),
-                    daemon=True,
-                ).start()
+            # Always use a daemon thread with its own event loop — never schedule
+            # on Jupyter's event loop via ensure_future, which only runs after the
+            # current cell finishes and would return the IFrame before the server
+            # is ready.  The thread starts immediately and _wait_for_port blocks
+            # here until the TCP socket is actually accepting connections, so the
+            # IFrame is only returned once the server is guaranteed to be up.
+            threading.Thread(
+                target=lambda: asyncio.run(_serve_background(port)),
+                daemon=True,
+            ).start()
+            _wait_for_port(port)
             _jupyter_server_port = port
 
         from IPython.display import IFrame  # only needed in Jupyter
