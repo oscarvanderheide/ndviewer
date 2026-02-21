@@ -9,6 +9,7 @@ from collections import OrderedDict
 import numpy as np
 import nibabel as nib
 import uvicorn
+import qmricolors  # for lipari and navia
 from fastapi import FastAPI, Request, Response, WebSocket
 from fastapi.responses import HTMLResponse
 from PIL import Image
@@ -18,7 +19,7 @@ DATA = None
 SHAPE = None
 GLOBAL_STATS = {}  # {dr_idx: (vmin, vmax)} sampled once at startup
 
-COLORMAPS = ['gray', 'viridis', 'plasma', 'RdBu_r']
+COLORMAPS = ["gray", "lipari", "navia", "viridis", "plasma", "RdBu_r"]
 DR_PERCENTILES = [(0, 100), (1, 99), (5, 95), (10, 90)]
 DR_LABELS = ['0-100%', '1-99%', '5-95%', '10-90%']
 
