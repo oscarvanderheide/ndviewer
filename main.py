@@ -8,7 +8,6 @@ from collections import OrderedDict
 import numpy as np
 import nibabel as nib
 import uvicorn
-import qmricolors  # for lipari and navia
 from fastapi import FastAPI, Request, Response, WebSocket
 from fastapi.responses import HTMLResponse
 from PIL import Image
@@ -185,7 +184,9 @@ def render_mosaic(dim_x, dim_y, dim_z, idx_tuple, colormap, dr):
 
     n = SHAPE[dim_z]
     frames = [
-        extract_slice(dim_x, dim_y, [i if j == dim_z else idx_tuple[j] for j in range(len(SHAPE))])
+        extract_slice(
+            dim_x, dim_y, [i if j == dim_z else idx_tuple[j] for j in range(len(SHAPE))]
+        )
         for i in range(n)
     ]
     all_data = np.stack(frames)  # (n, H, W)
@@ -201,7 +202,11 @@ def render_mosaic(dim_x, dim_y, dim_z, idx_tuple, colormap, dr):
     H, W = frames[0].shape
     padded = np.zeros((rows * cols, H, W), dtype=np.float32)
     padded[:n] = all_data
-    grid = padded.reshape(rows, cols, H, W).transpose(0, 2, 1, 3).reshape(rows * H, cols * W)
+    grid = (
+        padded.reshape(rows, cols, H, W)
+        .transpose(0, 2, 1, 3)
+        .reshape(rows * H, cols * W)
+    )
 
     if vmax > vmin:
         normalized = np.clip((grid - vmin) / (vmax - vmin), 0, 1)
@@ -296,7 +301,7 @@ async def websocket_endpoint(ws: WebSocket):
             dr = int(msg.get("dr", 1))
             slice_dim = int(msg.get("slice_dim", -1))
             direction = int(msg.get("direction", 1))
-            dim_z     = int(msg.get("dim_z", -1))
+            dim_z = int(msg.get("dim_z", -1))
 
             # Run blocking numpy work in a thread so the receiver stays live
             if dim_z >= 0:
@@ -320,9 +325,14 @@ async def websocket_endpoint(ws: WebSocket):
                 if 0 <= slice_dim < len(SHAPE):
 
                     def _prefetch(
-                        dim_x=dim_x, dim_y=dim_y, idx_tuple=idx_tuple,
-                        colormap=colormap, dr=dr,
-                        slice_dim=slice_dim, direction=direction, dim_z=dim_z,
+                        dim_x=dim_x,
+                        dim_y=dim_y,
+                        idx_tuple=idx_tuple,
+                        colormap=colormap,
+                        dr=dr,
+                        slice_dim=slice_dim,
+                        direction=direction,
+                        dim_z=dim_z,
                     ):
                         for i in range(1, 5):
                             nxt = idx_tuple[slice_dim] + direction * i
@@ -330,7 +340,9 @@ async def websocket_endpoint(ws: WebSocket):
                                 idx = list(idx_tuple)
                                 idx[slice_dim] = nxt
                                 if dim_z >= 0:
-                                    render_mosaic(dim_x, dim_y, dim_z, tuple(idx), colormap, dr)
+                                    render_mosaic(
+                                        dim_x, dim_y, dim_z, tuple(idx), colormap, dr
+                                    )
                                 else:
                                     render_rgba(dim_x, dim_y, tuple(idx), colormap, dr)
 
@@ -364,7 +376,7 @@ async def start_preload(request: Request):
     colormap = str(body.get("colormap", "gray"))
     dr = int(body.get("dr", 1))
     slice_dim = int(body["slice_dim"])
-    dim_z     = int(body.get("dim_z", -1))
+    dim_z = int(body.get("dim_z", -1))
 
     # Cancel any running preload and start a new one
     _preload_gen += 1
