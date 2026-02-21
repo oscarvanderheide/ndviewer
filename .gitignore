@@ -11,3 +11,4 @@ wheels/
 
 *.npy
 .claude/
+CLAUDE.md
