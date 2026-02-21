@@ -21,6 +21,9 @@ import qmricolors  # registers lipari, navia colormaps with matplotlib  # noqa: 
 DATA = None
 SHAPE = None
 GLOBAL_STATS = {}  # {dr_idx: (vmin, vmax)} sampled once at startup
+_data_filepath: str | None = None   # set when data is loaded from a file
+_fft_original_data = None           # stored before FFT so we can toggle back
+_fft_axes: tuple | None = None
 
 COLORMAPS = ["gray", "lipari", "navia", "viridis", "plasma", "RdBu_r"]
 DR_PERCENTILES = [(0, 100), (1, 99), (5, 95), (10, 90)]
@@ -46,6 +49,10 @@ def _lut_to_gradient_stops(lut, n=32):
 
 # 32-stop RGB gradient for each colormap (embedded in the JS for colorbar drawing)
 COLORMAP_GRADIENT_STOPS = {name: _lut_to_gradient_stops(LUTS[name]) for name in COLORMAPS}
+
+# Complex-mode labels.  For complex data all 4 are valid; for real data only the first 2.
+COMPLEX_MODES = ["mag", "phase", "real", "imag"]
+REAL_MODES    = ["real", "mag"]
 
 app = FastAPI()
 
@@ -111,12 +118,18 @@ def compute_global_stats():
         GLOBAL_STATS = {}
 
 
-def _compute_vmin_vmax(extracted, dr):
-    """Return (vmin, vmax) for the given extracted array and DR index."""
-    if dr in GLOBAL_STATS:
+def _compute_vmin_vmax(data, dr, complex_mode=0):
+    """Return (vmin, vmax) for the given float32 data array.
+
+    Phase always maps to [-π, π].  Magnitude (mode 0) uses precomputed global
+    stats when available.  All other modes use per-slice percentiles.
+    """
+    if complex_mode == 1:  # phase: fixed physical range
+        return (-float(np.pi), float(np.pi))
+    if complex_mode == 0 and dr in GLOBAL_STATS:
         return GLOBAL_STATS[dr]
     pct_lo, pct_hi = DR_PERCENTILES[dr % len(DR_PERCENTILES)]
-    return float(np.percentile(extracted, pct_lo)), float(np.percentile(extracted, pct_hi))
+    return float(np.percentile(data, pct_lo)), float(np.percentile(data, pct_hi))
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +157,7 @@ _preload_lock = threading.Lock()
 
 
 def extract_slice(dim_x, dim_y, idx_list):
+    """Return the raw slice as float32 (real data) or complex64 (complex data)."""
     key = (dim_x, dim_y, tuple(idx_list))
     if key in _raw_cache:
         _raw_cache.move_to_end(key)
@@ -153,11 +167,12 @@ def extract_slice(dim_x, dim_y, idx_list):
         slice(None) if i in (dim_x, dim_y) else idx_list[i] for i in range(len(SHAPE))
     ]
     extracted = np.array(DATA[tuple(slicer)])
-    if np.iscomplexobj(extracted):
-        extracted = np.abs(extracted)
     if dim_x < dim_y:
         extracted = extracted.T
-    result = np.nan_to_num(extracted).astype(np.float32)
+    if np.iscomplexobj(extracted):
+        result = np.nan_to_num(extracted).astype(np.complex64)
+    else:
+        result = np.nan_to_num(extracted).astype(np.float32)
 
     _raw_cache[key] = result
     if len(_raw_cache) > _RAW_CACHE_MAX:
@@ -165,55 +180,72 @@ def extract_slice(dim_x, dim_y, idx_list):
     return result
 
 
-def apply_colormap_rgba(extracted, colormap, dr):
-    """Map float32 array → RGBA uint8 array using precomputed global stats."""
-    vmin, vmax = _compute_vmin_vmax(extracted, dr)
-    if vmax > vmin:
-        normalized = np.clip((extracted - vmin) / (vmax - vmin), 0, 1)
+def apply_complex_mode(raw, complex_mode):
+    """Apply the requested view mode and return a float32 array.
+
+    For complex data: 0=magnitude, 1=phase, 2=real, 3=imaginary.
+    For real data:    0=real (identity), 1=magnitude (abs).
+    """
+    if np.iscomplexobj(raw):
+        if complex_mode == 1:
+            result = np.angle(raw)
+        elif complex_mode == 2:
+            result = raw.real.copy()
+        elif complex_mode == 3:
+            result = raw.imag.copy()
+        else:  # 0 = magnitude
+            result = np.abs(raw)
     else:
-        normalized = np.zeros_like(extracted)
+        result = np.abs(raw) if complex_mode == 1 else raw
+    return np.nan_to_num(result).astype(np.float32)
+
+
+def apply_colormap_rgba(raw, colormap, dr, complex_mode=0):
+    """Apply complex mode, normalise, and map → RGBA uint8 (H, W, 4)."""
+    data = apply_complex_mode(raw, complex_mode)
+    vmin, vmax = _compute_vmin_vmax(data, dr, complex_mode)
+    if vmax > vmin:
+        normalized = np.clip((data - vmin) / (vmax - vmin), 0, 1)
+    else:
+        normalized = np.zeros_like(data)
     lut = LUTS.get(colormap, LUTS["gray"])
     return lut[(normalized * 255).astype(np.uint8)]  # (H, W, 4)
 
 
-def render_rgba(dim_x, dim_y, idx_tuple, colormap, dr):
+def render_rgba(dim_x, dim_y, idx_tuple, colormap, dr, complex_mode=0):
     """Return cached RGBA (H, W, 4) uint8 array."""
-    key = (dim_x, dim_y, idx_tuple, colormap, dr)
+    key = (dim_x, dim_y, idx_tuple, colormap, dr, complex_mode)
     if key in _rgba_cache:
         _rgba_cache.move_to_end(key)
         return _rgba_cache[key]
-    extracted = extract_slice(dim_x, dim_y, list(idx_tuple))
-    rgba = apply_colormap_rgba(extracted, colormap, dr)
+    raw = extract_slice(dim_x, dim_y, list(idx_tuple))
+    rgba = apply_colormap_rgba(raw, colormap, dr, complex_mode)
     _rgba_cache[key] = rgba
     if len(_rgba_cache) > _RGBA_CACHE_MAX:
         _rgba_cache.popitem(last=False)
     return rgba
 
 
-def render_mosaic(dim_x, dim_y, dim_z, idx_tuple, colormap, dr):
+def render_mosaic(dim_x, dim_y, dim_z, idx_tuple, colormap, dr, complex_mode=0):
     """Return cached RGBA mosaic of all dim_z slices."""
     idx_norm = list(idx_tuple)
     idx_norm[dim_z] = 0  # dim_z position in idx doesn't affect the mosaic
-    key = (dim_x, dim_y, dim_z, tuple(idx_norm), colormap, dr)
+    key = (dim_x, dim_y, dim_z, tuple(idx_norm), colormap, dr, complex_mode)
     if key in _mosaic_cache:
         _mosaic_cache.move_to_end(key)
         return _mosaic_cache[key]
 
     n = SHAPE[dim_z]
-    frames = [
+    frames_raw = [
         extract_slice(
             dim_x, dim_y, [i if j == dim_z else idx_tuple[j] for j in range(len(SHAPE))]
         )
         for i in range(n)
     ]
-    all_data = np.stack(frames)  # (n, H, W)
+    frames = [apply_complex_mode(f, complex_mode) for f in frames_raw]
+    all_data = np.stack(frames)  # (n, H, W) float32
 
-    if dr in GLOBAL_STATS:
-        vmin, vmax = GLOBAL_STATS[dr]
-    else:
-        pct_lo, pct_hi = DR_PERCENTILES[dr % len(DR_PERCENTILES)]
-        vmin = float(np.percentile(all_data, pct_lo))
-        vmax = float(np.percentile(all_data, pct_hi))
+    vmin, vmax = _compute_vmin_vmax(all_data, dr, complex_mode)
 
     rows, cols = mosaic_shape(n)
     H, W = frames[0].shape
@@ -238,7 +270,7 @@ def render_mosaic(dim_x, dim_y, dim_z, idx_tuple, colormap, dr):
     return rgba
 
 
-def _run_preload(gen, dim_x, dim_y, idx_list, colormap, dr, slice_dim, dim_z=-1):
+def _run_preload(gen, dim_x, dim_y, idx_list, colormap, dr, slice_dim, dim_z=-1, complex_mode=0):
     """Background thread: pre-render every slice of slice_dim into cache."""
     global _preload_done, _preload_total, _preload_skipped, _RGBA_CACHE_MAX
 
@@ -268,9 +300,9 @@ def _run_preload(gen, dim_x, dim_y, idx_list, colormap, dr, slice_dim, dim_z=-1)
         idx = list(idx_list)
         idx[slice_dim] = i
         if dim_z >= 0:
-            render_mosaic(dim_x, dim_y, dim_z, tuple(idx), colormap, dr)
+            render_mosaic(dim_x, dim_y, dim_z, tuple(idx), colormap, dr, complex_mode)
         else:
-            render_rgba(dim_x, dim_y, tuple(idx), colormap, dr)
+            render_rgba(dim_x, dim_y, tuple(idx), colormap, dr, complex_mode)
         with _preload_lock:
             _preload_done = i + 1
 
@@ -319,15 +351,16 @@ async def websocket_endpoint(ws: WebSocket):
             slice_dim = int(msg.get("slice_dim", -1))
             direction = int(msg.get("direction", 1))
             dim_z = int(msg.get("dim_z", -1))
+            complex_mode = int(msg.get("complex_mode", 0))
 
             # Run blocking numpy work in a thread so the receiver stays live
             if dim_z >= 0:
                 rgba = await loop.run_in_executor(
-                    None, render_mosaic, dim_x, dim_y, dim_z, idx_tuple, colormap, dr
+                    None, render_mosaic, dim_x, dim_y, dim_z, idx_tuple, colormap, dr, complex_mode
                 )
             else:
                 rgba = await loop.run_in_executor(
-                    None, render_rgba, dim_x, dim_y, idx_tuple, colormap, dr
+                    None, render_rgba, dim_x, dim_y, idx_tuple, colormap, dr, complex_mode
                 )
 
             # Another request may have arrived while we were rendering — send
@@ -336,11 +369,9 @@ async def websocket_endpoint(ws: WebSocket):
                 h, w = rgba.shape[:2]
 
                 # Compute vmin/vmax for the colorbar
-                if dim_z >= 0:
-                    vmin, vmax = GLOBAL_STATS.get(dr, (0.0, 1.0))
-                else:
-                    extracted = extract_slice(dim_x, dim_y, list(idx_tuple))  # cached
-                    vmin, vmax = _compute_vmin_vmax(extracted, dr)
+                raw = extract_slice(dim_x, dim_y, list(idx_tuple))  # cached
+                data = apply_complex_mode(raw, complex_mode)
+                vmin, vmax = _compute_vmin_vmax(data, dr, complex_mode)
 
                 # Header: [seq, w, h] as uint32 (12 bytes) + [vmin, vmax] as float32 (8 bytes)
                 header = np.array([seq, w, h], dtype=np.uint32).tobytes()
@@ -360,6 +391,7 @@ async def websocket_endpoint(ws: WebSocket):
                         slice_dim=slice_dim,
                         direction=direction,
                         dim_z=dim_z,
+                        complex_mode=complex_mode,
                     ):
                         for i in range(1, 5):
                             nxt = idx_tuple[slice_dim] + direction * i
@@ -368,10 +400,10 @@ async def websocket_endpoint(ws: WebSocket):
                                 idx[slice_dim] = nxt
                                 if dim_z >= 0:
                                     render_mosaic(
-                                        dim_x, dim_y, dim_z, tuple(idx), colormap, dr
+                                        dim_x, dim_y, dim_z, tuple(idx), colormap, dr, complex_mode
                                     )
                                 else:
-                                    render_rgba(dim_x, dim_y, tuple(idx), colormap, dr)
+                                    render_rgba(dim_x, dim_y, tuple(idx), colormap, dr, complex_mode)
 
                     loop.run_in_executor(None, _prefetch)
 
@@ -404,13 +436,14 @@ async def start_preload(request: Request):
     dr = int(body.get("dr", 1))
     slice_dim = int(body["slice_dim"])
     dim_z = int(body.get("dim_z", -1))
+    complex_mode = int(body.get("complex_mode", 0))
 
     # Cancel any running preload and start a new one
     _preload_gen += 1
     gen = _preload_gen
     threading.Thread(
         target=_run_preload,
-        args=(gen, dim_x, dim_y, idx_list, colormap, dr, slice_dim, dim_z),
+        args=(gen, dim_x, dim_y, idx_list, colormap, dr, slice_dim, dim_z, complex_mode),
         daemon=True,
     ).start()
     return {"status": "started"}
@@ -428,17 +461,18 @@ def get_preload_status():
 
 @app.get("/metadata")
 def get_metadata():
-    return {"shape": list(SHAPE)}
+    return {"shape": list(SHAPE), "is_complex": bool(np.iscomplexobj(DATA))}
 
 
 @app.get("/pixel")
-def get_pixel(dim_x: int, dim_y: int, indices: str, px: int, py: int):
-    """Return the raw data value at canvas pixel (px, py) for the current slice."""
+def get_pixel(dim_x: int, dim_y: int, indices: str, px: int, py: int, complex_mode: int = 0):
+    """Return the displayed data value at canvas pixel (px, py) for the current slice."""
     idx_tuple = tuple(int(x) for x in indices.split(","))
-    extracted = extract_slice(dim_x, dim_y, list(idx_tuple))
-    h, w = extracted.shape
+    raw = extract_slice(dim_x, dim_y, list(idx_tuple))
+    data = apply_complex_mode(raw, complex_mode)
+    h, w = data.shape
     if 0 <= py < h and 0 <= px < w:
-        val = float(extracted[py, px])
+        val = float(data[py, px])
     else:
         val = float("nan")
     return {"value": val}
@@ -633,6 +667,7 @@ def get_ui():
 <span class="key">y</span>  swap vertical dim with slice dim
 <span class="key">Space</span>  toggle auto-play
 <span class="key">z</span>  claim dim as z (grid), scroll through next dim
+<span class="key">m</span>  cycle complex mode (mag/phase/real/imag)
 <span class="key">c</span>  cycle colormap
 <span class="key">d</span>  cycle dynamic range
 <span class="key">b</span>  toggle colorbar
@@ -655,6 +690,12 @@ def get_ui():
         const COLORMAP_GRADIENT_STOPS = """
         + json.dumps(COLORMAP_GRADIENT_STOPS)
         + """;
+        const COMPLEX_MODES = """
+        + str(COMPLEX_MODES)
+        + """;
+        const REAL_MODES = """
+        + str(REAL_MODES)
+        + """;
 
         let shape = [];
         let dim_x = 0, dim_y = 1, current_slice_dim = 2;
@@ -664,6 +705,8 @@ def get_ui():
         let dim_z = -1;
         let lastDirection = 1;
         let isDark = true;
+        let isComplex = false;
+        let complexMode = 0;
 
         // Colorbar state
         let showColorbar = false;
@@ -817,6 +860,7 @@ def get_ui():
                     indices: [...indices],
                     colormap: COLORMAPS[colormap_idx],
                     dr: dr_idx,
+                    complex_mode: complexMode,
                     slice_dim: current_slice_dim,
                 })
             });
@@ -844,11 +888,16 @@ def get_ui():
             const res = await fetch('/metadata');
             const data = await res.json();
             shape = data.shape;
+            isComplex = data.is_complex || false;
             indices = shape.map(s => Math.floor(s / 2));
             dim_x = 0; dim_y = 1;
             current_slice_dim = shape.length > 2 ? 2 : 0;
             initWebSocket();  // calls updateView() on open
             triggerPreload();
+        }
+
+        function getModeLabel() {
+            return isComplex ? COMPLEX_MODES[complexMode] : REAL_MODES[complexMode];
         }
 
         function renderInfo() {
@@ -861,6 +910,8 @@ def get_ui():
             }).join(', ');
             let text = `Shape: [${shape.join(', ')}]\\n`;
             text += `Index: [${idxStr}]`;
+            if (isComplex || complexMode !== 0)
+                text += `  <span class="muted">${getModeLabel()}</span>`;
             text += `  <span class="muted">(? for help)</span>`;
             document.getElementById('info').innerHTML = text;
         }
@@ -877,6 +928,7 @@ def get_ui():
                 indices: [...indices],
                 colormap: COLORMAPS[colormap_idx],
                 dr: dr_idx,
+                complex_mode: complexMode,
                 slice_dim: current_slice_dim,
                 direction: lastDirection,
             }));
@@ -937,7 +989,7 @@ def get_ui():
             const rect = canvas.getBoundingClientRect();
             const px = Math.floor((e.clientX - rect.left) * canvas.width / rect.width);
             const py = Math.floor((e.clientY - rect.top) * canvas.height / rect.height);
-            fetch(`/pixel?dim_x=${dim_x}&dim_y=${dim_y}&indices=${indices.join(',')}&px=${px}&py=${py}`)
+            fetch(`/pixel?dim_x=${dim_x}&dim_y=${dim_y}&indices=${indices.join(',')}&px=${px}&py=${py}&complex_mode=${complexMode}`)
                 .then(r => r.json())
                 .then(d => {
                     const el = document.getElementById('pixel-info');
@@ -996,6 +1048,11 @@ def get_ui():
                 saveScreenshot();
             } else if (e.key === 'g') {
                 saveGif();
+            } else if (e.key === 'm') {
+                const modeCount = isComplex ? COMPLEX_MODES.length : REAL_MODES.length;
+                complexMode = (complexMode + 1) % modeCount;
+                updateView(); triggerPreload();
+                showToast(`mode: ${getModeLabel()}`);
             } else if (e.key === 'c') {
                 colormap_idx = (colormap_idx + 1) % COLORMAPS.length;
                 fetch('/clearcache'); updateView(); triggerPreload();
