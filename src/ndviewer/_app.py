@@ -875,6 +875,96 @@ def get_ui():
     return HTMLResponse(content=html_content)
 
 
+# ---------------------------------------------------------------------------
+# Jupyter / in-process API
+# ---------------------------------------------------------------------------
+_jupyter_server_port: int | None = None  # port of the running background server
+
+
+def _in_jupyter() -> bool:
+    try:
+        from IPython import get_ipython
+
+        shell = get_ipython()
+        return shell is not None and hasattr(shell, "kernel")
+    except ImportError:
+        return False
+
+
+async def _serve_background(port: int):
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
+    server = uvicorn.Server(config)
+    await server.serve()
+
+
+def _set_data(data):
+    """Update the global DATA/SHAPE and flush all caches."""
+    global DATA, SHAPE
+    if isinstance(data, str):
+        data = load_data(data)
+    DATA = data
+    SHAPE = data.shape
+    _raw_cache.clear()
+    _rgba_cache.clear()
+    _mosaic_cache.clear()
+    compute_global_stats()
+
+
+def view(data, port: int = 8123, inline: bool | None = None, height: int = 750):
+    """View an ND array inline in Jupyter or in a browser window.
+
+    Parameters
+    ----------
+    data:
+        NumPy array (or anything with ``.shape``) to view, or a file path string.
+    port:
+        Local port for the FastAPI server (default 8123).
+    inline:
+        ``True``  – embed an IFrame in the Jupyter cell output.
+        ``False`` – open a browser window (blocking, like the CLI).
+        ``None``  – auto-detect: inline when inside Jupyter, browser otherwise.
+    height:
+        IFrame height in pixels (inline mode only).
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from ndviewer import view
+    >>> view(np.random.rand(64, 64, 30))          # auto-detects Jupyter
+    >>> view("scan.nii.gz", port=8124)            # new port for a second array
+    """
+    global _jupyter_server_port
+
+    _set_data(data)
+
+    if inline is None:
+        inline = _in_jupyter()
+
+    url = f"http://127.0.0.1:{port}"
+
+    if inline:
+        # Start a background server the first time (or when the port changes).
+        if _jupyter_server_port != port:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(_serve_background(port))
+            else:
+                # Fallback: daemon thread wrapping its own event loop.
+                threading.Thread(
+                    target=lambda: asyncio.run(_serve_background(port)),
+                    daemon=True,
+                ).start()
+            _jupyter_server_port = port
+
+        from IPython.display import IFrame  # only needed in Jupyter
+
+        return IFrame(src=url, width="100%", height=height)
+    else:
+        # Blocking browser mode (same as CLI).
+        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+        uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+
+
 def main():
     global DATA, SHAPE
 
