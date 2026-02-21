@@ -1,4 +1,3 @@
-
 import argparse
 import asyncio
 import io
@@ -21,14 +20,17 @@ GLOBAL_STATS = {}  # {dr_idx: (vmin, vmax)} sampled once at startup
 
 COLORMAPS = ["gray", "lipari", "navia", "viridis", "plasma", "RdBu_r"]
 DR_PERCENTILES = [(0, 100), (1, 99), (5, 95), (10, 90)]
-DR_LABELS = ['0-100%', '1-99%', '5-95%', '10-90%']
+DR_LABELS = ["0-100%", "1-99%", "5-95%", "10-90%"]
 
 # RGBA lookup tables (256 x 4)
 LUTS = {
-    name: np.concatenate([
-        (mpl_colormaps[name](np.arange(256) / 255.0) * 255).astype(np.uint8)[:, :3],
-        np.full((256, 1), 255, dtype=np.uint8)
-    ], axis=1)
+    name: np.concatenate(
+        [
+            (mpl_colormaps[name](np.arange(256) / 255.0) * 255).astype(np.uint8)[:, :3],
+            np.full((256, 1), 255, dtype=np.uint8),
+        ],
+        axis=1,
+    )
     for name in COLORMAPS
 }
 
@@ -36,16 +38,19 @@ app = FastAPI()
 
 
 def load_data(filepath):
-    if filepath.endswith('.npy'):
-        return np.load(filepath, mmap_mode='r')
-    elif filepath.endswith('.nii') or filepath.endswith('.nii.gz'):
+    if filepath.endswith(".npy"):
+        return np.load(filepath, mmap_mode="r")
+    elif filepath.endswith(".nii") or filepath.endswith(".nii.gz"):
         img = nib.load(filepath)
         return img.dataobj
-    elif filepath.endswith('.zarr') or filepath.endswith('.zarr.zip'):
+    elif filepath.endswith(".zarr") or filepath.endswith(".zarr.zip"):
         import zarr
-        return zarr.open(filepath, mode='r')
+
+        return zarr.open(filepath, mode="r")
     else:
-        raise ValueError("Unsupported format. Please provide a .npy, .nii/.nii.gz, or .zarr file")
+        raise ValueError(
+            "Unsupported format. Please provide a .npy, .nii/.nii.gz, or .zarr file"
+        )
 
 
 def mosaic_shape(batch):
@@ -81,7 +86,7 @@ def _sample_for_stats(max_samples=200_000):
 def compute_global_stats():
     global GLOBAL_STATS
     try:
-        print("Computing global contrast statistics...", end='', flush=True)
+        print("Computing global contrast statistics...", end="", flush=True)
         sample = _sample_for_stats()
         GLOBAL_STATS = {
             i: (float(np.percentile(sample, lo)), float(np.percentile(sample, hi)))
@@ -104,13 +109,16 @@ _RAW_CACHE_MAX = 200
 _rgba_cache = OrderedDict()
 _RGBA_CACHE_MAX = 512
 
+_mosaic_cache = OrderedDict()
+_MOSAIC_CACHE_MAX = 64  # mosaics are large; 64 is plenty
+
 # ---------------------------------------------------------------------------
 # Background preload state
 # ---------------------------------------------------------------------------
-_preload_gen = 0         # increment to cancel the running preload thread
-_preload_done = 0        # slices rendered so far
-_preload_total = 0       # total slices in current preload
-_preload_skipped = False # True when array is too large to preload
+_preload_gen = 0  # increment to cancel the running preload thread
+_preload_done = 0  # slices rendered so far
+_preload_total = 0  # total slices in current preload
+_preload_skipped = False  # True when array is too large to preload
 _preload_lock = threading.Lock()
 
 
@@ -120,8 +128,9 @@ def extract_slice(dim_x, dim_y, idx_list):
         _raw_cache.move_to_end(key)
         return _raw_cache[key]
 
-    slicer = [slice(None) if i in (dim_x, dim_y) else idx_list[i]
-              for i in range(len(SHAPE))]
+    slicer = [
+        slice(None) if i in (dim_x, dim_y) else idx_list[i] for i in range(len(SHAPE))
+    ]
     extracted = np.array(DATA[tuple(slicer)])
     if np.iscomplexobj(extracted):
         extracted = np.abs(extracted)
@@ -147,7 +156,7 @@ def apply_colormap_rgba(extracted, colormap, dr):
         normalized = np.clip((extracted - vmin) / (vmax - vmin), 0, 1)
     else:
         normalized = np.zeros_like(extracted)
-    lut = LUTS.get(colormap, LUTS['gray'])
+    lut = LUTS.get(colormap, LUTS["gray"])
     return lut[(normalized * 255).astype(np.uint8)]  # (H, W, 4)
 
 
@@ -165,14 +174,61 @@ def render_rgba(dim_x, dim_y, idx_tuple, colormap, dr):
     return rgba
 
 
-def _run_preload(gen, dim_x, dim_y, idx_list, colormap, dr, slice_dim):
-    """Background thread: pre-render every slice of slice_dim into _rgba_cache."""
+def render_mosaic(dim_x, dim_y, dim_z, idx_tuple, colormap, dr):
+    """Return cached RGBA mosaic of all dim_z slices."""
+    idx_norm = list(idx_tuple)
+    idx_norm[dim_z] = 0  # dim_z position in idx doesn't affect the mosaic
+    key = (dim_x, dim_y, dim_z, tuple(idx_norm), colormap, dr)
+    if key in _mosaic_cache:
+        _mosaic_cache.move_to_end(key)
+        return _mosaic_cache[key]
+
+    n = SHAPE[dim_z]
+    frames = [
+        extract_slice(dim_x, dim_y, [i if j == dim_z else idx_tuple[j] for j in range(len(SHAPE))])
+        for i in range(n)
+    ]
+    all_data = np.stack(frames)  # (n, H, W)
+
+    if dr in GLOBAL_STATS:
+        vmin, vmax = GLOBAL_STATS[dr]
+    else:
+        pct_lo, pct_hi = DR_PERCENTILES[dr % len(DR_PERCENTILES)]
+        vmin = float(np.percentile(all_data, pct_lo))
+        vmax = float(np.percentile(all_data, pct_hi))
+
+    rows, cols = mosaic_shape(n)
+    H, W = frames[0].shape
+    padded = np.zeros((rows * cols, H, W), dtype=np.float32)
+    padded[:n] = all_data
+    grid = padded.reshape(rows, cols, H, W).transpose(0, 2, 1, 3).reshape(rows * H, cols * W)
+
+    if vmax > vmin:
+        normalized = np.clip((grid - vmin) / (vmax - vmin), 0, 1)
+    else:
+        normalized = np.zeros_like(grid)
+
+    lut = LUTS.get(colormap, LUTS["gray"])
+    rgba = lut[(normalized * 255).astype(np.uint8)]
+    _mosaic_cache[key] = rgba
+    if len(_mosaic_cache) > _MOSAIC_CACHE_MAX:
+        _mosaic_cache.popitem(last=False)
+    return rgba
+
+
+def _run_preload(gen, dim_x, dim_y, idx_list, colormap, dr, slice_dim, dim_z=-1):
+    """Background thread: pre-render every slice of slice_dim into cache."""
     global _preload_done, _preload_total, _preload_skipped, _RGBA_CACHE_MAX
 
     n = SHAPE[slice_dim]
     H = SHAPE[dim_y]
     W = SHAPE[dim_x]
-    size_bytes = n * H * W * 4  # RGBA bytes for the full dimension
+    if dim_z >= 0:
+        nz = SHAPE[dim_z]
+        mrows, mcols = mosaic_shape(nz)
+        size_bytes = n * (mrows * H) * (mcols * W) * 4
+    else:
+        size_bytes = n * H * W * 4
 
     with _preload_lock:
         _preload_total = n
@@ -181,15 +237,18 @@ def _run_preload(gen, dim_x, dim_y, idx_list, colormap, dr, slice_dim):
             _preload_skipped = True
             return
         _preload_skipped = False
-        # Grow the cache so the full dimension fits without eviction
-        _RGBA_CACHE_MAX = max(512, n * 4)
+        if dim_z < 0:
+            _RGBA_CACHE_MAX = max(512, n * 4)
 
     for i in range(n):
-        if _preload_gen != gen:  # a newer preload was requested — abort
+        if _preload_gen != gen:
             return
         idx = list(idx_list)
         idx[slice_dim] = i
-        render_rgba(dim_x, dim_y, tuple(idx), colormap, dr)
+        if dim_z >= 0:
+            render_mosaic(dim_x, dim_y, dim_z, tuple(idx), colormap, dr)
+        else:
+            render_rgba(dim_x, dim_y, tuple(idx), colormap, dr)
         with _preload_lock:
             _preload_done = i + 1
 
@@ -212,7 +271,7 @@ async def websocket_endpoint(ws: WebSocket):
         try:
             while True:
                 msg = await ws.receive_json()
-                seq = int(msg.get('seq', 0))
+                seq = int(msg.get("seq", 0))
                 if seq > latest_seq:
                     latest_seq = seq
                     latest_msg = msg
@@ -228,20 +287,26 @@ async def websocket_endpoint(ws: WebSocket):
             if latest_msg is None:
                 break
 
-            msg       = latest_msg
-            seq       = latest_seq
-            dim_x     = int(msg['dim_x'])
-            dim_y     = int(msg['dim_y'])
-            idx_tuple = tuple(int(x) for x in msg['indices'])
-            colormap  = str(msg.get('colormap', 'gray'))
-            dr        = int(msg.get('dr', 1))
-            slice_dim = int(msg.get('slice_dim', -1))
-            direction = int(msg.get('direction', 1))
+            msg = latest_msg
+            seq = latest_seq
+            dim_x = int(msg["dim_x"])
+            dim_y = int(msg["dim_y"])
+            idx_tuple = tuple(int(x) for x in msg["indices"])
+            colormap = str(msg.get("colormap", "gray"))
+            dr = int(msg.get("dr", 1))
+            slice_dim = int(msg.get("slice_dim", -1))
+            direction = int(msg.get("direction", 1))
+            dim_z     = int(msg.get("dim_z", -1))
 
             # Run blocking numpy work in a thread so the receiver stays live
-            rgba = await loop.run_in_executor(
-                None, render_rgba, dim_x, dim_y, idx_tuple, colormap, dr
-            )
+            if dim_z >= 0:
+                rgba = await loop.run_in_executor(
+                    None, render_mosaic, dim_x, dim_y, dim_z, idx_tuple, colormap, dr
+                )
+            else:
+                rgba = await loop.run_in_executor(
+                    None, render_rgba, dim_x, dim_y, idx_tuple, colormap, dr
+                )
 
             # Another request may have arrived while we were rendering — send
             # only if this is still the one the client is waiting for
@@ -253,15 +318,22 @@ async def websocket_endpoint(ws: WebSocket):
                 # Warm the cache for the next few slices in the scroll direction
                 # so the following keypresses are instant cache hits
                 if 0 <= slice_dim < len(SHAPE):
-                    def _prefetch(dim_x=dim_x, dim_y=dim_y, idx_tuple=idx_tuple,
-                                  colormap=colormap, dr=dr,
-                                  slice_dim=slice_dim, direction=direction):
+
+                    def _prefetch(
+                        dim_x=dim_x, dim_y=dim_y, idx_tuple=idx_tuple,
+                        colormap=colormap, dr=dr,
+                        slice_dim=slice_dim, direction=direction, dim_z=dim_z,
+                    ):
                         for i in range(1, 5):
                             nxt = idx_tuple[slice_dim] + direction * i
                             if 0 <= nxt < SHAPE[slice_dim]:
                                 idx = list(idx_tuple)
                                 idx[slice_dim] = nxt
-                                render_rgba(dim_x, dim_y, tuple(idx), colormap, dr)
+                                if dim_z >= 0:
+                                    render_mosaic(dim_x, dim_y, dim_z, tuple(idx), colormap, dr)
+                                else:
+                                    render_rgba(dim_x, dim_y, tuple(idx), colormap, dr)
+
                     loop.run_in_executor(None, _prefetch)
 
     except Exception:
@@ -278,6 +350,7 @@ async def websocket_endpoint(ws: WebSocket):
 def clear_cache():
     _raw_cache.clear()
     _rgba_cache.clear()
+    _mosaic_cache.clear()
     return {"status": "ok"}
 
 
@@ -285,19 +358,20 @@ def clear_cache():
 async def start_preload(request: Request):
     global _preload_gen
     body = await request.json()
-    dim_x     = int(body['dim_x'])
-    dim_y     = int(body['dim_y'])
-    idx_list  = [int(x) for x in body['indices']]
-    colormap  = str(body.get('colormap', 'gray'))
-    dr        = int(body.get('dr', 1))
-    slice_dim = int(body['slice_dim'])
+    dim_x = int(body["dim_x"])
+    dim_y = int(body["dim_y"])
+    idx_list = [int(x) for x in body["indices"]]
+    colormap = str(body.get("colormap", "gray"))
+    dr = int(body.get("dr", 1))
+    slice_dim = int(body["slice_dim"])
+    dim_z     = int(body.get("dim_z", -1))
 
     # Cancel any running preload and start a new one
     _preload_gen += 1
     gen = _preload_gen
     threading.Thread(
         target=_run_preload,
-        args=(gen, dim_x, dim_y, idx_list, colormap, dr, slice_dim),
+        args=(gen, dim_x, dim_y, idx_list, colormap, dr, slice_dim, dim_z),
         daemon=True,
     ).start()
     return {"status": "started"}
@@ -319,20 +393,37 @@ def get_metadata():
 
 
 @app.get("/slice")
-def get_slice(dim_x: int, dim_y: int, indices: str, colormap: str = 'gray', dr: int = 1, slice_dim: int = -1):
+def get_slice(
+    dim_x: int,
+    dim_y: int,
+    indices: str,
+    colormap: str = "gray",
+    dr: int = 1,
+    slice_dim: int = -1,
+):
     """HTTP fallback (used by nothing in the UI, kept for debugging)."""
-    idx_tuple = tuple(int(x) for x in indices.split(','))
+    idx_tuple = tuple(int(x) for x in indices.split(","))
     rgba = render_rgba(dim_x, dim_y, idx_tuple, colormap, dr)
-    img = Image.fromarray(rgba[:, :, :3], mode='RGB')
+    img = Image.fromarray(rgba[:, :, :3], mode="RGB")
     buf = io.BytesIO()
-    img.save(buf, format='JPEG', quality=90)
-    return Response(content=buf.getvalue(), media_type="image/jpeg",
-                    headers={"Cache-Control": "max-age=300"})
+    img.save(buf, format="JPEG", quality=90)
+    return Response(
+        content=buf.getvalue(),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "max-age=300"},
+    )
 
 
 @app.get("/grid")
-def get_grid(dim_x: int, dim_y: int, indices: str, slice_dim: int, colormap: str = 'gray', dr: int = 1):
-    idx_list = [int(x) for x in indices.split(',')]
+def get_grid(
+    dim_x: int,
+    dim_y: int,
+    indices: str,
+    slice_dim: int,
+    colormap: str = "gray",
+    dr: int = 1,
+):
+    idx_list = [int(x) for x in indices.split(",")]
     n = SHAPE[slice_dim]
     frames = []
     for i in range(n):
@@ -351,24 +442,35 @@ def get_grid(dim_x: int, dim_y: int, indices: str, slice_dim: int, colormap: str
     H, W = frames[0].shape
     padded = np.zeros((rows * cols, H, W), dtype=np.float32)
     padded[:n] = all_data
-    mosaic = padded.reshape(rows, cols, H, W).transpose(0, 2, 1, 3).reshape(rows * H, cols * W)
+    mosaic = (
+        padded.reshape(rows, cols, H, W)
+        .transpose(0, 2, 1, 3)
+        .reshape(rows * H, cols * W)
+    )
 
     if vmax > vmin:
         normalized = np.clip((mosaic - vmin) / (vmax - vmin), 0, 1)
     else:
         normalized = np.zeros_like(mosaic)
 
-    lut = LUTS.get(colormap if colormap in LUTS else 'gray', LUTS['gray'])
+    lut = LUTS.get(colormap if colormap in LUTS else "gray", LUTS["gray"])
     rgba = lut[(normalized * 255).astype(np.uint8)]
-    img = Image.fromarray(rgba[:, :, :3], mode='RGB')
+    img = Image.fromarray(rgba[:, :, :3], mode="RGB")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return Response(content=buf.getvalue(), media_type="image/png")
 
 
 @app.get("/gif")
-def get_gif(dim_x: int, dim_y: int, indices: str, slice_dim: int, colormap: str = 'gray', dr: int = 1):
-    idx_list = [int(x) for x in indices.split(',')]
+def get_gif(
+    dim_x: int,
+    dim_y: int,
+    indices: str,
+    slice_dim: int,
+    colormap: str = "gray",
+    dr: int = 1,
+):
+    idx_list = [int(x) for x in indices.split(",")]
     n = SHAPE[slice_dim]
     frames = []
     for i in range(n):
@@ -383,7 +485,7 @@ def get_gif(dim_x: int, dim_y: int, indices: str, slice_dim: int, colormap: str 
         vmin = float(np.percentile(all_data, pct_lo))
         vmax = float(np.percentile(all_data, pct_hi))
 
-    lut = LUTS.get(colormap if colormap in LUTS else 'gray', LUTS['gray'])
+    lut = LUTS.get(colormap if colormap in LUTS else "gray", LUTS["gray"])
     gif_frames = []
     for frame in frames:
         if vmax > vmin:
@@ -391,17 +493,24 @@ def get_gif(dim_x: int, dim_y: int, indices: str, slice_dim: int, colormap: str 
         else:
             normalized = np.zeros_like(frame)
         rgba = lut[(normalized * 255).astype(np.uint8)]
-        gif_frames.append(Image.fromarray(rgba[:, :, :3], mode='RGB'))
+        gif_frames.append(Image.fromarray(rgba[:, :, :3], mode="RGB"))
 
     buf = io.BytesIO()
-    gif_frames[0].save(buf, format='GIF', save_all=True,
-                       append_images=gif_frames[1:], loop=0, duration=100)
+    gif_frames[0].save(
+        buf,
+        format="GIF",
+        save_all=True,
+        append_images=gif_frames[1:],
+        loop=0,
+        duration=100,
+    )
     return Response(content=buf.getvalue(), media_type="image/gif")
 
 
 @app.get("/")
 def get_ui():
-    html_content = """<!DOCTYPE html>
+    html_content = (
+        """<!DOCTYPE html>
 <html>
 <head>
     <title>NDViewer</title>
@@ -454,7 +563,7 @@ def get_ui():
 <span class="key">x</span>  swap horizontal dim with slice dim
 <span class="key">y</span>  swap vertical dim with slice dim
 <span class="key">Space</span>  toggle auto-play
-<span class="key">z</span>  toggle grid (all slices mosaic)
+<span class="key">z</span>  claim dim as z (grid), scroll through next dim
 <span class="key">c</span>  cycle colormap
 <span class="key">d</span>  cycle dynamic range
 <span class="key">t</span>  toggle dark / light theme
@@ -464,15 +573,19 @@ def get_ui():
 <span class="key">?</span>  toggle this help</div>
     </div>
     <script>
-        const COLORMAPS = """ + str(COLORMAPS) + """;
-        const DR_LABELS = """ + str(DR_LABELS) + """;
+        const COLORMAPS = """
+        + str(COLORMAPS)
+        + """;
+        const DR_LABELS = """
+        + str(DR_LABELS)
+        + """;
 
         let shape = [];
         let dim_x = 0, dim_y = 1, current_slice_dim = 2;
         let indices = [];
         let colormap_idx = 0, dr_idx = 1;
         let isPlaying = false, playInterval = null;
-        let gridMode = false;
+        let dim_z = -1;
         let lastDirection = 1;
         let isDark = true;
 
@@ -553,7 +666,7 @@ def get_ui():
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({
-                    dim_x, dim_y,
+                    dim_x, dim_y, dim_z,
                     indices: [...indices],
                     colormap: COLORMAPS[colormap_idx],
                     dr: dr_idx,
@@ -595,12 +708,12 @@ def get_ui():
             const idxStr = indices.map((v, i) => {
                 if (i === dim_x) return 'x';
                 if (i === dim_y) return 'y';
+                if (i === dim_z) return 'z';
                 if (i === current_slice_dim) return `<span class="highlight">[${v}]</span>`;
                 return v;
             }).join(', ');
             let text = `Shape: [${shape.join(', ')}]\\n`;
             text += `Index: [${idxStr}]`;
-            if (gridMode) text += `  <span class="highlight">[GRID]</span>`;
             text += `  <span class="muted">(? for help)</span>`;
             document.getElementById('info').innerHTML = text;
         }
@@ -609,30 +722,11 @@ def get_ui():
 
         function updateView() {
             renderInfo();
-
-            if (gridMode) {
-                // Grid is a one-off render — HTTP is fine
-                const url = `/grid?dim_x=${dim_x}&dim_y=${dim_y}&indices=${indices.join(',')}&colormap=${COLORMAPS[colormap_idx]}&dr=${dr_idx}&slice_dim=${current_slice_dim}`;
-                fetch(url).then(r => r.blob()).then(blob => {
-                    const objUrl = URL.createObjectURL(blob);
-                    const img = new Image();
-                    img.onload = () => {
-                        canvas.width = img.width; canvas.height = img.height;
-                        ctx.drawImage(img, 0, 0);
-                        scaleCanvas(img.width, img.height);
-                        URL.revokeObjectURL(objUrl);
-                    };
-                    img.src = objUrl;
-                });
-                return;
-            }
-
             if (!wsReady) return;
-
             wsSentSeq++;
             ws.send(JSON.stringify({
                 seq: wsSentSeq,
-                dim_x, dim_y,
+                dim_x, dim_y, dim_z,
                 indices: [...indices],
                 colormap: COLORMAPS[colormap_idx],
                 dr: dr_idx,
@@ -684,12 +778,21 @@ def get_ui():
             if (e.key === '?') { helpOverlay.classList.toggle('visible'); return; }
             if (e.key === 'Escape') { helpOverlay.classList.remove('visible'); return; }
             if (e.key === 'z') {
-                gridMode = !gridMode;
-                if (gridMode && isPlaying) togglePlay();
-                updateView();
+                if (dim_z >= 0) {
+                    // Exit z-mode: restore dim_z back as the scroll dim
+                    current_slice_dim = dim_z;
+                    dim_z = -1;
+                } else {
+                    // Enter z-mode: claim current scroll dim as z, advance scroll
+                    if (shape.length < 4) return;  // need a free dim to scroll through
+                    dim_z = current_slice_dim;
+                    do { current_slice_dim = (current_slice_dim + 1) % shape.length; }
+                    while (current_slice_dim === dim_x || current_slice_dim === dim_y || current_slice_dim === dim_z);
+                }
+                updateView(); triggerPreload();
             } else if (e.key === ' ') {
                 e.preventDefault();
-                if (!gridMode) togglePlay();
+                togglePlay();
             } else if (e.key === 't') {
                 isDark = !isDark;
                 document.body.classList.toggle('light', !isDark);
@@ -707,27 +810,31 @@ def get_ui():
                 showToast(`range: ${DR_LABELS[dr_idx]}`);
             } else if (e.key === 'j' || e.key === 'ArrowDown') {
                 e.preventDefault();
-                if (!gridMode) { lastDirection = -1; indices[current_slice_dim] = Math.max(0, indices[current_slice_dim] - 1); updateView(); }
+                lastDirection = -1; indices[current_slice_dim] = Math.max(0, indices[current_slice_dim] - 1); updateView();
             } else if (e.key === 'k' || e.key === 'ArrowUp') {
                 e.preventDefault();
-                if (!gridMode) { lastDirection = 1; indices[current_slice_dim] = Math.min(shape[current_slice_dim] - 1, indices[current_slice_dim] + 1); updateView(); }
+                lastDirection = 1; indices[current_slice_dim] = Math.min(shape[current_slice_dim] - 1, indices[current_slice_dim] + 1); updateView();
             } else if (e.key === 'h' || e.key === 'ArrowLeft') {
                 e.preventDefault();
+                const minFree = dim_z >= 0 ? 3 : 2;
                 do { current_slice_dim = (current_slice_dim - 1 + shape.length) % shape.length; }
-                while ((current_slice_dim === dim_x || current_slice_dim === dim_y) && shape.length > 2);
+                while ((current_slice_dim === dim_x || current_slice_dim === dim_y || current_slice_dim === dim_z) && shape.length > minFree);
                 updateView(); triggerPreload();
             } else if (e.key === 'l' || e.key === 'ArrowRight') {
                 e.preventDefault();
+                const minFree = dim_z >= 0 ? 3 : 2;
                 do { current_slice_dim = (current_slice_dim + 1) % shape.length; }
-                while ((current_slice_dim === dim_x || current_slice_dim === dim_y) && shape.length > 2);
+                while ((current_slice_dim === dim_x || current_slice_dim === dim_y || current_slice_dim === dim_z) && shape.length > minFree);
                 updateView(); triggerPreload();
             } else if (e.key === 'x') {
                 if (shape.length < 3) return;
                 [dim_x, current_slice_dim] = [current_slice_dim, dim_x];
+                dim_z = -1;
                 updateView(); triggerPreload();
             } else if (e.key === 'y') {
                 if (shape.length < 3) return;
                 [dim_y, current_slice_dim] = [current_slice_dim, dim_y];
+                dim_z = -1;
                 updateView(); triggerPreload();
             }
         });
@@ -736,7 +843,6 @@ def get_ui():
 
         window.addEventListener('wheel', (e) => {
             e.preventDefault();
-            if (gridMode) return;
             if (e.deltaY > 0) {
                 lastDirection = -1;
                 indices[current_slice_dim] = Math.max(0, indices[current_slice_dim] - 1);
@@ -751,6 +857,7 @@ def get_ui():
     </script>
 </body>
 </html>"""
+    )
     return HTMLResponse(content=html_content)
 
 
@@ -776,5 +883,6 @@ if __name__ == "__main__":
 
     url = f"http://127.0.0.1:{args.port}"
     import webbrowser
+
     threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
