@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import io
+import json
 import socket
 import sys
 import time
@@ -36,6 +37,15 @@ LUTS = {
     )
     for name in COLORMAPS
 }
+
+
+def _lut_to_gradient_stops(lut, n=32):
+    indices = np.linspace(0, 255, n, dtype=int)
+    return [[int(lut[i, 0]), int(lut[i, 1]), int(lut[i, 2])] for i in indices]
+
+
+# 32-stop RGB gradient for each colormap (embedded in the JS for colorbar drawing)
+COLORMAP_GRADIENT_STOPS = {name: _lut_to_gradient_stops(LUTS[name]) for name in COLORMAPS}
 
 app = FastAPI()
 
@@ -101,6 +111,14 @@ def compute_global_stats():
         GLOBAL_STATS = {}
 
 
+def _compute_vmin_vmax(extracted, dr):
+    """Return (vmin, vmax) for the given extracted array and DR index."""
+    if dr in GLOBAL_STATS:
+        return GLOBAL_STATS[dr]
+    pct_lo, pct_hi = DR_PERCENTILES[dr % len(DR_PERCENTILES)]
+    return float(np.percentile(extracted, pct_lo)), float(np.percentile(extracted, pct_hi))
+
+
 # ---------------------------------------------------------------------------
 # Two-level cache:
 #  1. Raw float32 slice (LRU ~200 slices — avoids re-reading disk on colormap/DR change)
@@ -149,12 +167,7 @@ def extract_slice(dim_x, dim_y, idx_list):
 
 def apply_colormap_rgba(extracted, colormap, dr):
     """Map float32 array → RGBA uint8 array using precomputed global stats."""
-    if dr in GLOBAL_STATS:
-        vmin, vmax = GLOBAL_STATS[dr]
-    else:
-        pct_lo, pct_hi = DR_PERCENTILES[dr % len(DR_PERCENTILES)]
-        vmin = float(np.percentile(extracted, pct_lo))
-        vmax = float(np.percentile(extracted, pct_hi))
+    vmin, vmax = _compute_vmin_vmax(extracted, dr)
     if vmax > vmin:
         normalized = np.clip((extracted - vmin) / (vmax - vmin), 0, 1)
     else:
@@ -321,8 +334,18 @@ async def websocket_endpoint(ws: WebSocket):
             # only if this is still the one the client is waiting for
             if seq == latest_seq:
                 h, w = rgba.shape[:2]
+
+                # Compute vmin/vmax for the colorbar
+                if dim_z >= 0:
+                    vmin, vmax = GLOBAL_STATS.get(dr, (0.0, 1.0))
+                else:
+                    extracted = extract_slice(dim_x, dim_y, list(idx_tuple))  # cached
+                    vmin, vmax = _compute_vmin_vmax(extracted, dr)
+
+                # Header: [seq, w, h] as uint32 (12 bytes) + [vmin, vmax] as float32 (8 bytes)
                 header = np.array([seq, w, h], dtype=np.uint32).tobytes()
-                await ws.send_bytes(header + rgba.tobytes())
+                vminmax = np.array([vmin, vmax], dtype=np.float32).tobytes()
+                await ws.send_bytes(header + vminmax + rgba.tobytes())
 
                 # Warm the cache for the next few slices in the scroll direction
                 # so the following keypresses are instant cache hits
@@ -406,6 +429,19 @@ def get_preload_status():
 @app.get("/metadata")
 def get_metadata():
     return {"shape": list(SHAPE)}
+
+
+@app.get("/pixel")
+def get_pixel(dim_x: int, dim_y: int, indices: str, px: int, py: int):
+    """Return the raw data value at canvas pixel (px, py) for the current slice."""
+    idx_tuple = tuple(int(x) for x in indices.split(","))
+    extracted = extract_slice(dim_x, dim_y, list(idx_tuple))
+    h, w = extracted.shape
+    if 0 <= py < h and 0 <= px < w:
+        val = float(extracted[py, px])
+    else:
+        val = float("nan")
+    return {"value": val}
 
 
 @app.get("/slice")
@@ -548,10 +584,13 @@ def get_ui():
             --highlight: #000; --canvas-border: #999;
         }
         #info { margin-bottom: 20px; font-size: 16px; white-space: pre-wrap; text-align: left; background: var(--surface); padding: 15px; border-radius: 8px; border: 1px solid var(--border); width: fit-content; }
+        #viewer-row { position: relative; display: inline-block; }
         canvas { border: 1px solid var(--canvas-border); image-rendering: pixelated; outline: none; cursor: crosshair; }
+        #colorbar { display: none; position: absolute; left: 100%; top: 0; margin-left: 6px; border: none; cursor: default; }
         .highlight { color: var(--highlight); font-weight: bold; }
         .muted { color: var(--muted); }
         #status { margin-top: 8px; font-size: 13px; color: var(--muted); min-height: 1.2em; }
+        #pixel-info { margin-top: 2px; font-size: 12px; color: var(--text); min-height: 1em; font-family: monospace; }
         #preload-status { margin-top: 4px; font-size: 12px; color: var(--subtle); min-height: 1em; }
         #toast {
             margin-top: 8px; font-size: 13px; color: var(--text);
@@ -573,12 +612,16 @@ def get_ui():
 <body>
 <div id="wrapper">
     <div id="info">Connecting...</div>
-    <canvas id="viewer" tabindex="0"></canvas>
+    <div id="viewer-row">
+        <canvas id="viewer" tabindex="0"></canvas>
+        <canvas id="colorbar"></canvas>
+    </div>
     <!-- Hidden textarea: VS Code passes all keys (including arrows) to focused text inputs,
          unlike other focusable elements where it intercepts navigation keys. -->
     <textarea id="keyboard-sink" autocomplete="off" autocorrect="off" spellcheck="false"
               style="position:fixed;top:-1px;left:-1px;width:1px;height:1px;opacity:0;border:none;padding:0;margin:0;resize:none;overflow:hidden;"></textarea>
     <div id="status"></div>
+    <div id="pixel-info"></div>
     <div id="toast"></div>
     <div id="preload-status"></div>
     <div id="help-overlay">
@@ -592,11 +635,13 @@ def get_ui():
 <span class="key">z</span>  claim dim as z (grid), scroll through next dim
 <span class="key">c</span>  cycle colormap
 <span class="key">d</span>  cycle dynamic range
+<span class="key">b</span>  toggle colorbar
 <span class="key">t</span>  toggle dark / light theme
 <span class="key">s</span>  save screenshot (PNG)
 <span class="key">g</span>  save GIF of current slice dim
 <span class="key">+ / -</span>  zoom in / out
 <span class="key">scroll</span>  scroll through slices
+<span class="key">hover</span>  show pixel value
 <span class="key">?</span>  toggle this help</div>
     </div>
 </div>
@@ -607,6 +652,9 @@ def get_ui():
         const DR_LABELS = """
         + str(DR_LABELS)
         + """;
+        const COLORMAP_GRADIENT_STOPS = """
+        + json.dumps(COLORMAP_GRADIENT_STOPS)
+        + """;
 
         let shape = [];
         let dim_x = 0, dim_y = 1, current_slice_dim = 2;
@@ -616,6 +664,11 @@ def get_ui():
         let dim_z = -1;
         let lastDirection = 1;
         let isDark = true;
+
+        // Colorbar state
+        let showColorbar = false;
+        let currentVmin = 0, currentVmax = 1;
+        let lastImageData = null, lastImgW = 0, lastImgH = 0;
 
         // WebSocket state
         let ws = null, wsReady = false, wsSentSeq = 0;
@@ -630,8 +683,13 @@ def get_ui():
         // Zoom state
         let userZoom = 0.6;
 
+        // Pixel hover throttle
+        let pixelHoverPending = false;
+
         const canvas = document.getElementById('viewer');
         const ctx = canvas.getContext('2d');
+        const colorbarCanvas = document.getElementById('colorbar');
+        const cbCtx = colorbarCanvas.getContext('2d');
         const sink = document.getElementById('keyboard-sink');
 
         function scaleCanvas(w, h) {
@@ -640,6 +698,7 @@ def get_ui():
             const scale = Math.min(maxW / w, maxH / h) * userZoom;
             canvas.style.width  = Math.round(w * scale) + 'px';
             canvas.style.height = Math.round(h * scale) + 'px';
+            if (showColorbar) drawColorbar();
         }
 
         function showToast(msg) {
@@ -652,6 +711,54 @@ def get_ui():
                 el.style.transition = 'opacity 0.8s ease';
                 el.style.opacity = '0';
             }, 1500);
+        }
+
+        function drawColorbar() {
+            const stops = COLORMAP_GRADIENT_STOPS[COLORMAPS[colormap_idx]];
+            const n = stops.length;
+            const dpr = window.devicePixelRatio || 1;
+            const cssH = parseInt(canvas.style.height);
+            const cbCSSW = 50, barW = 14, barX = 8;
+            const barH = Math.max(60, cssH - 40);
+            const barY = Math.floor((cssH - barH) / 2);
+
+            // Draw at CSS pixel resolution × dpr for crisp output
+            colorbarCanvas.width = Math.round(cbCSSW * dpr);
+            colorbarCanvas.height = Math.round(cssH * dpr);
+            colorbarCanvas.style.width = cbCSSW + 'px';
+            colorbarCanvas.style.height = cssH + 'px';
+            cbCtx.scale(dpr, dpr);
+
+            // No background fill — transparent canvas shows page bg through
+
+            // Draw gradient bar row by row in CSS-pixel space
+            for (let row = 0; row < barH; row++) {
+                const t = 1 - row / (barH - 1);
+                const fi = t * (n - 1);
+                const lo = Math.floor(fi), hi = Math.min(lo + 1, n - 1);
+                const frac = fi - lo;
+                const r = Math.round(stops[lo][0] * (1 - frac) + stops[hi][0] * frac);
+                const g = Math.round(stops[lo][1] * (1 - frac) + stops[hi][1] * frac);
+                const b = Math.round(stops[lo][2] * (1 - frac) + stops[hi][2] * frac);
+                cbCtx.fillStyle = `rgb(${r},${g},${b})`;
+                cbCtx.fillRect(barX, barY + row, barW, 1);
+            }
+
+            cbCtx.strokeStyle = '#888'; cbCtx.lineWidth = 1;
+            cbCtx.strokeRect(barX - 0.5, barY - 0.5, barW + 1, barH + 1);
+
+            const fmt = v => {
+                const av = Math.abs(v);
+                if (av === 0) return '0';
+                if (av >= 1e4 || (av < 1e-2 && av > 0)) return v.toExponential(2);
+                return parseFloat(v.toPrecision(3)).toString();
+            };
+            cbCtx.font = '10px monospace';
+            cbCtx.textAlign = 'left';
+            cbCtx.fillStyle = isDark ? '#ddd' : '#222';
+            const labelX = barX + barW + 3;
+            cbCtx.fillText(fmt(currentVmax), labelX, barY + 9);
+            cbCtx.fillText(fmt(currentVmin), labelX, barY + barH);
         }
 
         function initWebSocket() {
@@ -668,18 +775,25 @@ def get_ui():
 
             ws.onmessage = (event) => {
                 const buf = event.data;
-                const header = new Uint32Array(buf, 0, 3);
-                const seq    = header[0];
-                const width  = header[1];
-                const height = header[2];
+                // Header: [seq, w, h] as uint32 (12 bytes) + [vmin, vmax] as float32 (8 bytes)
+                const headerU32 = new Uint32Array(buf, 0, 3);
+                const seq    = headerU32[0];
+                const width  = headerU32[1];
+                const height = headerU32[2];
 
                 // Discard stale frames — only render the most recently requested seq
                 if (seq !== wsSentSeq) return;
 
-                const rgba = new Uint8ClampedArray(buf, 12);
+                const headerF32 = new Float32Array(buf, 12, 2);
+                currentVmin = headerF32[0];
+                currentVmax = headerF32[1];
+
+                const rgba = new Uint8ClampedArray(buf.slice(20));
+                lastImageData = new ImageData(rgba, width, height);
+                lastImgW = width; lastImgH = height;
                 canvas.width  = width;
                 canvas.height = height;
-                ctx.putImageData(new ImageData(rgba, width, height), 0, 0);
+                ctx.putImageData(lastImageData, 0, 0);
                 scaleCanvas(width, height);
             };
 
@@ -814,6 +928,33 @@ def get_ui():
         canvas.addEventListener('click', () => sink.focus());
         document.addEventListener('click', () => sink.focus());
 
+        // Pixel value on hover
+        canvas.addEventListener('mousemove', (e) => {
+            if (dim_z >= 0) return;  // skip mosaic mode
+            if (pixelHoverPending) return;
+            pixelHoverPending = true;
+            setTimeout(() => { pixelHoverPending = false; }, 50);
+            const rect = canvas.getBoundingClientRect();
+            const px = Math.floor((e.clientX - rect.left) * canvas.width / rect.width);
+            const py = Math.floor((e.clientY - rect.top) * canvas.height / rect.height);
+            fetch(`/pixel?dim_x=${dim_x}&dim_y=${dim_y}&indices=${indices.join(',')}&px=${px}&py=${py}`)
+                .then(r => r.json())
+                .then(d => {
+                    const el = document.getElementById('pixel-info');
+                    if (d.value !== undefined && isFinite(d.value)) {
+                        const av = Math.abs(d.value);
+                        const fmt = v => (av >= 1e4 || (av < 1e-2 && av > 0))
+                            ? v.toExponential(3) : parseFloat(v.toPrecision(4)).toString();
+                        el.textContent = `(${px}, ${py}) = ${fmt(d.value)}`;
+                    } else {
+                        el.textContent = '';
+                    }
+                });
+        });
+        canvas.addEventListener('mouseleave', () => {
+            document.getElementById('pixel-info').textContent = '';
+        });
+
         sink.addEventListener('keydown', (e) => {
             e.preventDefault();            // stop browser default (e.g. textarea scrolling)
             e.stopImmediatePropagation();  // stop other handlers
@@ -827,6 +968,11 @@ def get_ui():
                 userZoom = Math.max(userZoom / 1.02, 0.1);
                 scaleCanvas(canvas.width, canvas.height);
                 showToast(`zoom: ${Math.round(userZoom * 100)}%`);
+            } else if (e.key === 'b') {
+                showColorbar = !showColorbar;
+                colorbarCanvas.style.display = showColorbar ? 'block' : 'none';
+                if (showColorbar && lastImageData) drawColorbar();
+                showToast(showColorbar ? 'colorbar: on' : 'colorbar: off');
             } else if (e.key === 'z') {
                 if (dim_z >= 0) {
                     // Exit z-mode: restore dim_z back as the scroll dim
