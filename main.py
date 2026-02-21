@@ -405,29 +405,45 @@ def get_ui():
 <head>
     <title>NDViewer</title>
     <style>
-        body { background: #111; color: #00ffcc; font-family: monospace; display: flex; flex-direction: column; align-items: center; padding-top: 20px; margin:0;}
-        #info { margin-bottom: 20px; font-size: 16px; white-space: pre-wrap; text-align: left; background: #222; padding: 15px; border-radius: 8px; border: 1px solid #444; width: 600px;}
-        canvas { border: 1px solid #555; image-rendering: pixelated; }
-        .highlight { color: #fff; font-weight: bold; }
-        #status { margin-top: 8px; font-size: 13px; color: #888; min-height: 1.2em; }
-        #preload-status { margin-top: 4px; font-size: 12px; color: #555; min-height: 1em; }
+        :root {
+            --bg: #111; --surface: #1e1e1e; --border: #444;
+            --text: #ccc; --muted: #777; --subtle: #444;
+            --highlight: #fff; --canvas-border: #555;
+        }
+        body.light {
+            --bg: #f0f0f0; --surface: #e0e0e0; --border: #bbb;
+            --text: #333; --muted: #888; --subtle: #bbb;
+            --highlight: #000; --canvas-border: #999;
+        }
+        body { background: var(--bg); color: var(--text); font-family: monospace; display: flex; flex-direction: column; align-items: center; padding-top: 20px; margin: 0; }
+        #info { margin-bottom: 20px; font-size: 16px; white-space: pre-wrap; text-align: left; background: var(--surface); padding: 15px; border-radius: 8px; border: 1px solid var(--border); width: 600px; }
+        canvas { border: 1px solid var(--canvas-border); image-rendering: pixelated; }
+        .highlight { color: var(--highlight); font-weight: bold; }
+        .muted { color: var(--muted); }
+        #status { margin-top: 8px; font-size: 13px; color: var(--muted); min-height: 1.2em; }
+        #preload-status { margin-top: 4px; font-size: 12px; color: var(--subtle); min-height: 1em; }
+        #toast {
+            margin-top: 8px; font-size: 13px; color: var(--text);
+            min-height: 1.2em; opacity: 0; transition: opacity 0.8s ease;
+        }
         #help-overlay {
             display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
             background: rgba(0,0,0,0.75); z-index: 10; justify-content: center; align-items: center;
         }
         #help-overlay.visible { display: flex; }
         #help-box {
-            background: #222; border: 1px solid #555; border-radius: 10px;
-            padding: 30px 40px; font-size: 15px; line-height: 2; color: #00ffcc;
+            background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+            padding: 30px 40px; font-size: 15px; line-height: 2; color: var(--text);
             white-space: pre;
         }
-        #help-box .key { color: #fff; font-weight: bold; display: inline-block; min-width: 140px; }
+        #help-box .key { color: var(--highlight); font-weight: bold; display: inline-block; min-width: 140px; }
     </style>
 </head>
 <body>
     <div id="info">Connecting...</div>
     <canvas id="viewer"></canvas>
     <div id="status"></div>
+    <div id="toast"></div>
     <div id="preload-status"></div>
     <div id="help-overlay">
         <div id="help-box"><span class="key">j / ↓</span>  previous slice
@@ -440,6 +456,7 @@ def get_ui():
 <span class="key">z</span>  toggle grid (all slices mosaic)
 <span class="key">c</span>  cycle colormap
 <span class="key">d</span>  cycle dynamic range
+<span class="key">t</span>  toggle dark / light theme
 <span class="key">s</span>  save screenshot (PNG)
 <span class="key">g</span>  save GIF of current slice dim
 <span class="key">scroll</span>  scroll through slices
@@ -456,6 +473,7 @@ def get_ui():
         let isPlaying = false, playInterval = null;
         let gridMode = false;
         let lastDirection = 1;
+        let isDark = true;
 
         // WebSocket state
         let ws = null, wsReady = false, wsSentSeq = 0;
@@ -463,6 +481,9 @@ def get_ui():
         // Preload polling state
         let preloadPolling = null;
         let preloadActiveDim = -1;
+
+        // Toast state
+        let toastTimer = null;
 
         const canvas = document.getElementById('viewer');
         const ctx = canvas.getContext('2d');
@@ -473,6 +494,18 @@ def get_ui():
             const scale = Math.min(maxW / w, maxH / h);
             canvas.style.width  = Math.round(w * scale) + 'px';
             canvas.style.height = Math.round(h * scale) + 'px';
+        }
+
+        function showToast(msg) {
+            const el = document.getElementById('toast');
+            el.textContent = msg;
+            el.style.transition = 'none';
+            el.style.opacity = '1';
+            if (toastTimer) clearTimeout(toastTimer);
+            toastTimer = setTimeout(() => {
+                el.style.transition = 'opacity 0.8s ease';
+                el.style.opacity = '0';
+            }, 1500);
         }
 
         function initWebSocket() {
@@ -565,10 +598,9 @@ def get_ui():
                 return v;
             }).join(', ');
             let text = `Shape: [${shape.join(', ')}]\\n`;
-            text += `Index: [${idxStr}]\\n`;
-            text += `Colormap: ${COLORMAPS[colormap_idx]}   DR: ${DR_LABELS[dr_idx]}`;
-            if (gridMode) text += `   <span style="color:#fff">  [GRID]</span>`;
-            text += `   <span style="color:#888">(? for help)</span>`;
+            text += `Index: [${idxStr}]`;
+            if (gridMode) text += `  <span class="highlight">[GRID]</span>`;
+            text += `  <span class="muted">(? for help)</span>`;
             document.getElementById('info').innerHTML = text;
         }
 
@@ -657,6 +689,9 @@ def get_ui():
             } else if (e.key === ' ') {
                 e.preventDefault();
                 if (!gridMode) togglePlay();
+            } else if (e.key === 't') {
+                isDark = !isDark;
+                document.body.classList.toggle('light', !isDark);
             } else if (e.key === 's') {
                 saveScreenshot();
             } else if (e.key === 'g') {
@@ -664,9 +699,11 @@ def get_ui():
             } else if (e.key === 'c') {
                 colormap_idx = (colormap_idx + 1) % COLORMAPS.length;
                 fetch('/clearcache'); updateView(); triggerPreload();
+                showToast(`colormap: ${COLORMAPS[colormap_idx]}`);
             } else if (e.key === 'd') {
                 dr_idx = (dr_idx + 1) % DR_LABELS.length;
                 fetch('/clearcache'); updateView(); triggerPreload();
+                showToast(`range: ${DR_LABELS[dr_idx]}`);
             } else if (e.key === 'j' || e.key === 'ArrowDown') {
                 e.preventDefault();
                 if (!gridMode) { lastDirection = -1; indices[current_slice_dim] = Math.max(0, indices[current_slice_dim] - 1); updateView(); }
