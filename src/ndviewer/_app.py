@@ -536,12 +536,17 @@ def get_ui():
             --text: #ccc; --muted: #777; --subtle: #444;
             --highlight: #fff; --canvas-border: #555;
         }
-        body.light {
+        html, body { background: transparent; margin: 0; padding: 0; }
+        #wrapper {
+            background: var(--bg); color: var(--text); font-family: monospace;
+            display: inline-flex; flex-direction: column; align-items: center;
+            padding: 16px 20px 20px; min-width: fit-content;
+        }
+        #wrapper.light {
             --bg: #f0f0f0; --surface: #e0e0e0; --border: #bbb;
             --text: #333; --muted: #888; --subtle: #bbb;
             --highlight: #000; --canvas-border: #999;
         }
-        body { background: var(--bg); color: var(--text); font-family: monospace; display: flex; flex-direction: column; align-items: center; padding-top: 20px; margin: 0; }
         #info { margin-bottom: 20px; font-size: 16px; white-space: pre-wrap; text-align: left; background: var(--surface); padding: 15px; border-radius: 8px; border: 1px solid var(--border); width: fit-content; }
         canvas { border: 1px solid var(--canvas-border); image-rendering: pixelated; outline: none; cursor: crosshair; }
         .highlight { color: var(--highlight); font-weight: bold; }
@@ -566,6 +571,7 @@ def get_ui():
     </style>
 </head>
 <body>
+<div id="wrapper">
     <div id="info">Connecting...</div>
     <canvas id="viewer" tabindex="0"></canvas>
     <!-- Hidden textarea: VS Code passes all keys (including arrows) to focused text inputs,
@@ -593,6 +599,7 @@ def get_ui():
 <span class="key">scroll</span>  scroll through slices
 <span class="key">?</span>  toggle this help</div>
     </div>
+</div>
     <script>
         const COLORMAPS = """
         + str(COLORMAPS)
@@ -838,7 +845,7 @@ def get_ui():
                 togglePlay();
             } else if (e.key === 't') {
                 isDark = !isDark;
-                document.body.classList.toggle('light', !isDark);
+                document.getElementById('wrapper').classList.toggle('light', !isDark);
             } else if (e.key === 's') {
                 saveScreenshot();
             } else if (e.key === 'g') {
@@ -954,7 +961,7 @@ def _set_data(data):
     compute_global_stats()
 
 
-def view(data, port: int = 8123, inline: bool | None = None, height: int = 750):
+def view(data, port: int = 8123, inline: bool | None = None, height: int = 500):
     """View an ND array inline in Jupyter or in a browser window.
 
     Parameters
