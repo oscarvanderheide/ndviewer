@@ -700,7 +700,8 @@ def get_ui():
             --highlight: #000; --canvas-border: #999;
         }
         #info { margin-bottom: 12px; font-size: 16px; white-space: nowrap; text-align: left; }
-        #viewer-row { position: relative; display: inline-block; }
+        #viewer-row { display: flex; align-items: center; justify-content: center; }
+        #canvas-wrap { position: relative; display: inline-block; line-height: 0; }
         canvas { border: 1px solid var(--canvas-border); image-rendering: pixelated; outline: none; cursor: crosshair; }
         #colorbar { display: none; position: absolute; left: 100%; top: 0; margin-left: 6px; border: none; cursor: default; }
         .highlight { color: var(--highlight); font-weight: bold; }
@@ -731,8 +732,10 @@ def get_ui():
 <div id="wrapper">
     <div id="info">Connecting...</div>
     <div id="viewer-row">
-        <canvas id="viewer" tabindex="0"></canvas>
-        <canvas id="colorbar"></canvas>
+        <div id="canvas-wrap">
+            <canvas id="viewer" tabindex="0"></canvas>
+            <canvas id="colorbar"></canvas>
+        </div>
     </div>
     <!-- Hidden textarea: VS Code passes all keys (including arrows) to focused text inputs,
          unlike other focusable elements where it intercepts navigation keys. -->
@@ -843,6 +846,25 @@ def get_ui():
             canvas.style.width  = Math.round(w * scale) + 'px';
             canvas.style.height = Math.round(h * scale) + 'px';
             if (showColorbar) drawColorbar();
+        }
+
+        function updateContainerSize() {
+            if (!shape.length) return;
+            const maxW = window.innerWidth * 0.95;
+            const maxH = window.innerHeight * 0.70;
+            let maxCSSW = 0, maxCSSH = 0;
+            for (let i = 0; i < shape.length; i++) {
+                for (let j = 0; j < shape.length; j++) {
+                    if (i === j) continue;
+                    const w = shape[i], h = shape[j];
+                    const scale = Math.min(maxW / w, maxH / h) * userZoom;
+                    maxCSSW = Math.max(maxCSSW, Math.round(w * scale));
+                    maxCSSH = Math.max(maxCSSH, Math.round(h * scale));
+                }
+            }
+            const row = document.getElementById('viewer-row');
+            row.style.minWidth  = maxCSSW + 'px';
+            row.style.minHeight = maxCSSH + 'px';
         }
 
         function showToast(msg) {
@@ -1024,6 +1046,7 @@ def get_ui():
             dim_x = 0; dim_y = 1;
             current_slice_dim = shape.length > 2 ? 2 : 0;
             activeDim = current_slice_dim;
+            updateContainerSize();
             initWebSocket();  // calls updateView() on open
             triggerPreload();
         }
@@ -1159,10 +1182,12 @@ def get_ui():
             if (e.key === '+' || e.key === '=') {
                 userZoom = Math.min(userZoom * 1.02, 8.0);
                 scaleCanvas(canvas.width, canvas.height);
+                updateContainerSize();
                 showToast(`zoom: ${Math.round(userZoom * 100)}%`);
             } else if (e.key === '-') {
                 userZoom = Math.max(userZoom / 1.02, 0.1);
                 scaleCanvas(canvas.width, canvas.height);
+                updateContainerSize();
                 showToast(`zoom: ${Math.round(userZoom * 100)}%`);
             } else if (e.key === 'b') {
                 showColorbar = !showColorbar;
