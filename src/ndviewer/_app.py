@@ -200,10 +200,22 @@ def apply_complex_mode(raw, complex_mode):
     return np.nan_to_num(result).astype(np.float32)
 
 
-def apply_colormap_rgba(raw, colormap, dr, complex_mode=0):
-    """Apply complex mode, normalise, and map → RGBA uint8 (H, W, 4)."""
+def _prepare_display(raw, complex_mode, dr, log_scale):
+    """Apply complex mode + optional log transform; return (data_f32, vmin, vmax)."""
     data = apply_complex_mode(raw, complex_mode)
-    vmin, vmax = _compute_vmin_vmax(data, dr, complex_mode)
+    if log_scale:
+        data = np.log1p(np.abs(data)).astype(np.float32)
+        pct_lo, pct_hi = DR_PERCENTILES[dr % len(DR_PERCENTILES)]
+        vmin = float(np.percentile(data, pct_lo))
+        vmax = float(np.percentile(data, pct_hi))
+    else:
+        vmin, vmax = _compute_vmin_vmax(data, dr, complex_mode)
+    return data, vmin, vmax
+
+
+def apply_colormap_rgba(raw, colormap, dr, complex_mode=0, log_scale=False):
+    """Apply complex mode, (optional log), normalise, and map → RGBA uint8 (H, W, 4)."""
+    data, vmin, vmax = _prepare_display(raw, complex_mode, dr, log_scale)
     if vmax > vmin:
         normalized = np.clip((data - vmin) / (vmax - vmin), 0, 1)
     else:
@@ -212,25 +224,25 @@ def apply_colormap_rgba(raw, colormap, dr, complex_mode=0):
     return lut[(normalized * 255).astype(np.uint8)]  # (H, W, 4)
 
 
-def render_rgba(dim_x, dim_y, idx_tuple, colormap, dr, complex_mode=0):
+def render_rgba(dim_x, dim_y, idx_tuple, colormap, dr, complex_mode=0, log_scale=False):
     """Return cached RGBA (H, W, 4) uint8 array."""
-    key = (dim_x, dim_y, idx_tuple, colormap, dr, complex_mode)
+    key = (dim_x, dim_y, idx_tuple, colormap, dr, complex_mode, log_scale)
     if key in _rgba_cache:
         _rgba_cache.move_to_end(key)
         return _rgba_cache[key]
     raw = extract_slice(dim_x, dim_y, list(idx_tuple))
-    rgba = apply_colormap_rgba(raw, colormap, dr, complex_mode)
+    rgba = apply_colormap_rgba(raw, colormap, dr, complex_mode, log_scale)
     _rgba_cache[key] = rgba
     if len(_rgba_cache) > _RGBA_CACHE_MAX:
         _rgba_cache.popitem(last=False)
     return rgba
 
 
-def render_mosaic(dim_x, dim_y, dim_z, idx_tuple, colormap, dr, complex_mode=0):
+def render_mosaic(dim_x, dim_y, dim_z, idx_tuple, colormap, dr, complex_mode=0, log_scale=False):
     """Return cached RGBA mosaic of all dim_z slices."""
     idx_norm = list(idx_tuple)
     idx_norm[dim_z] = 0  # dim_z position in idx doesn't affect the mosaic
-    key = (dim_x, dim_y, dim_z, tuple(idx_norm), colormap, dr, complex_mode)
+    key = (dim_x, dim_y, dim_z, tuple(idx_norm), colormap, dr, complex_mode, log_scale)
     if key in _mosaic_cache:
         _mosaic_cache.move_to_end(key)
         return _mosaic_cache[key]
@@ -243,9 +255,16 @@ def render_mosaic(dim_x, dim_y, dim_z, idx_tuple, colormap, dr, complex_mode=0):
         for i in range(n)
     ]
     frames = [apply_complex_mode(f, complex_mode) for f in frames_raw]
+    if log_scale:
+        frames = [np.log1p(np.abs(f)).astype(np.float32) for f in frames]
     all_data = np.stack(frames)  # (n, H, W) float32
 
-    vmin, vmax = _compute_vmin_vmax(all_data, dr, complex_mode)
+    if log_scale:
+        pct_lo, pct_hi = DR_PERCENTILES[dr % len(DR_PERCENTILES)]
+        vmin = float(np.percentile(all_data, pct_lo))
+        vmax = float(np.percentile(all_data, pct_hi))
+    else:
+        vmin, vmax = _compute_vmin_vmax(all_data, dr, complex_mode)
 
     rows, cols = mosaic_shape(n)
     H, W = frames[0].shape
@@ -270,7 +289,7 @@ def render_mosaic(dim_x, dim_y, dim_z, idx_tuple, colormap, dr, complex_mode=0):
     return rgba
 
 
-def _run_preload(gen, dim_x, dim_y, idx_list, colormap, dr, slice_dim, dim_z=-1, complex_mode=0):
+def _run_preload(gen, dim_x, dim_y, idx_list, colormap, dr, slice_dim, dim_z=-1, complex_mode=0, log_scale=False):
     """Background thread: pre-render every slice of slice_dim into cache."""
     global _preload_done, _preload_total, _preload_skipped, _RGBA_CACHE_MAX
 
@@ -300,9 +319,9 @@ def _run_preload(gen, dim_x, dim_y, idx_list, colormap, dr, slice_dim, dim_z=-1,
         idx = list(idx_list)
         idx[slice_dim] = i
         if dim_z >= 0:
-            render_mosaic(dim_x, dim_y, dim_z, tuple(idx), colormap, dr, complex_mode)
+            render_mosaic(dim_x, dim_y, dim_z, tuple(idx), colormap, dr, complex_mode, log_scale)
         else:
-            render_rgba(dim_x, dim_y, tuple(idx), colormap, dr, complex_mode)
+            render_rgba(dim_x, dim_y, tuple(idx), colormap, dr, complex_mode, log_scale)
         with _preload_lock:
             _preload_done = i + 1
 
@@ -352,15 +371,16 @@ async def websocket_endpoint(ws: WebSocket):
             direction = int(msg.get("direction", 1))
             dim_z = int(msg.get("dim_z", -1))
             complex_mode = int(msg.get("complex_mode", 0))
+            log_scale = bool(msg.get("log_scale", False))
 
             # Run blocking numpy work in a thread so the receiver stays live
             if dim_z >= 0:
                 rgba = await loop.run_in_executor(
-                    None, render_mosaic, dim_x, dim_y, dim_z, idx_tuple, colormap, dr, complex_mode
+                    None, render_mosaic, dim_x, dim_y, dim_z, idx_tuple, colormap, dr, complex_mode, log_scale
                 )
             else:
                 rgba = await loop.run_in_executor(
-                    None, render_rgba, dim_x, dim_y, idx_tuple, colormap, dr, complex_mode
+                    None, render_rgba, dim_x, dim_y, idx_tuple, colormap, dr, complex_mode, log_scale
                 )
 
             # Another request may have arrived while we were rendering — send
@@ -370,8 +390,7 @@ async def websocket_endpoint(ws: WebSocket):
 
                 # Compute vmin/vmax for the colorbar
                 raw = extract_slice(dim_x, dim_y, list(idx_tuple))  # cached
-                data = apply_complex_mode(raw, complex_mode)
-                vmin, vmax = _compute_vmin_vmax(data, dr, complex_mode)
+                _, vmin, vmax = _prepare_display(raw, complex_mode, dr, log_scale)
 
                 # Header: [seq, w, h] as uint32 (12 bytes) + [vmin, vmax] as float32 (8 bytes)
                 header = np.array([seq, w, h], dtype=np.uint32).tobytes()
@@ -392,6 +411,7 @@ async def websocket_endpoint(ws: WebSocket):
                         direction=direction,
                         dim_z=dim_z,
                         complex_mode=complex_mode,
+                        log_scale=log_scale,
                     ):
                         for i in range(1, 5):
                             nxt = idx_tuple[slice_dim] + direction * i
@@ -400,10 +420,10 @@ async def websocket_endpoint(ws: WebSocket):
                                 idx[slice_dim] = nxt
                                 if dim_z >= 0:
                                     render_mosaic(
-                                        dim_x, dim_y, dim_z, tuple(idx), colormap, dr, complex_mode
+                                        dim_x, dim_y, dim_z, tuple(idx), colormap, dr, complex_mode, log_scale
                                     )
                                 else:
-                                    render_rgba(dim_x, dim_y, tuple(idx), colormap, dr, complex_mode)
+                                    render_rgba(dim_x, dim_y, tuple(idx), colormap, dr, complex_mode, log_scale)
 
                     loop.run_in_executor(None, _prefetch)
 
@@ -437,13 +457,14 @@ async def start_preload(request: Request):
     slice_dim = int(body["slice_dim"])
     dim_z = int(body.get("dim_z", -1))
     complex_mode = int(body.get("complex_mode", 0))
+    log_scale = bool(body.get("log_scale", False))
 
     # Cancel any running preload and start a new one
     _preload_gen += 1
     gen = _preload_gen
     threading.Thread(
         target=_run_preload,
-        args=(gen, dim_x, dim_y, idx_list, colormap, dr, slice_dim, dim_z, complex_mode),
+        args=(gen, dim_x, dim_y, idx_list, colormap, dr, slice_dim, dim_z, complex_mode, log_scale),
         daemon=True,
     ).start()
     return {"status": "started"}
@@ -476,6 +497,67 @@ def get_pixel(dim_x: int, dim_y: int, indices: str, px: int, py: int, complex_mo
     else:
         val = float("nan")
     return {"value": val}
+
+
+@app.get("/info")
+def get_info():
+    try:
+        dtype_str = str(DATA.dtype)
+    except AttributeError:
+        dtype_str = "unknown"
+    info: dict = {
+        "shape": list(SHAPE),
+        "dtype": dtype_str,
+        "ndim": len(SHAPE),
+        "total_elements": int(np.prod(SHAPE)),
+        "is_complex": bool(np.iscomplexobj(DATA)),
+        "filepath": _data_filepath,
+    }
+    try:
+        info["size_mb"] = round(DATA.nbytes / 1024**2, 2)
+    except AttributeError:
+        info["size_mb"] = None
+    if _fft_axes is not None:
+        info["fft_axes"] = list(_fft_axes)
+    return info
+
+
+@app.post("/fft")
+async def toggle_fft(request: Request):
+    global DATA, SHAPE, _fft_original_data, _fft_axes
+    body = await request.json()
+    axes_str = str(body.get("axes", "")).strip()
+
+    if _fft_original_data is not None:
+        # Toggle off: restore original data
+        DATA = _fft_original_data
+        SHAPE = DATA.shape
+        _fft_original_data = None
+        _fft_axes = None
+        _raw_cache.clear()
+        _rgba_cache.clear()
+        _mosaic_cache.clear()
+        compute_global_stats()
+        return {"status": "restored", "is_complex": bool(np.iscomplexobj(DATA))}
+
+    # Toggle on: apply centred FFT
+    try:
+        axes = tuple(int(a.strip()) for a in axes_str.split(",") if a.strip())
+        if not axes:
+            raise ValueError("No axes specified")
+    except Exception as e:
+        return {"error": str(e)}
+
+    _fft_original_data = DATA
+    full = np.array(DATA)
+    DATA = np.fft.fftshift(np.fft.fftn(full, axes=axes), axes=axes)
+    SHAPE = DATA.shape
+    _fft_axes = axes
+    _raw_cache.clear()
+    _rgba_cache.clear()
+    _mosaic_cache.clear()
+    compute_global_stats()
+    return {"status": "fft_applied", "axes": list(axes), "is_complex": bool(np.iscomplexobj(DATA))}
 
 
 @app.get("/slice")
@@ -617,7 +699,7 @@ def get_ui():
             --text: #333; --muted: #888; --subtle: #bbb;
             --highlight: #000; --canvas-border: #999;
         }
-        #info { margin-bottom: 20px; font-size: 16px; white-space: pre-wrap; text-align: left; background: var(--surface); padding: 15px; border-radius: 8px; border: 1px solid var(--border); width: fit-content; }
+        #info { margin-bottom: 12px; font-size: 16px; white-space: nowrap; text-align: left; }
         #viewer-row { position: relative; display: inline-block; }
         canvas { border: 1px solid var(--canvas-border); image-rendering: pixelated; outline: none; cursor: crosshair; }
         #colorbar { display: none; position: absolute; left: 100%; top: 0; margin-left: 6px; border: none; cursor: default; }
@@ -641,6 +723,8 @@ def get_ui():
             white-space: pre;
         }
         #help-box .key { color: var(--highlight); font-weight: bold; display: inline-block; min-width: 140px; }
+        #help-hint { position: fixed; bottom: 12px; right: 16px; color: var(--muted); font-size: 14px; cursor: pointer; font-family: monospace; user-select: none; }
+        #data-info { margin-top: 8px; font-size: 13px; color: var(--text); white-space: pre; opacity: 0; transition: opacity 0.4s ease; pointer-events: none; }
     </style>
 </head>
 <body>
@@ -658,16 +742,21 @@ def get_ui():
     <div id="pixel-info"></div>
     <div id="toast"></div>
     <div id="preload-status"></div>
+    <div id="help-hint">?</div>
+    <div id="data-info"></div>
     <div id="help-overlay">
-        <div id="help-box"><span class="key">j / ↓</span>  previous slice
-<span class="key">k / ↑</span>  next slice
-<span class="key">h / ←</span>  previous slice dimension
-<span class="key">l / →</span>  next slice dimension
+        <div id="help-box"><span class="key">scroll</span>  previous / next slice (active dim)
+<span class="key">h / l / ← / →</span>  move cursor to prev / next dim
+<span class="key">j / ↓</span>  on x/y: flip axis  |  else: prev index
+<span class="key">k / ↑</span>  on x/y: flip axis  |  else: next index
+<span class="key">L</span>  toggle log scale
 <span class="key">x</span>  swap horizontal dim with slice dim
 <span class="key">y</span>  swap vertical dim with slice dim
 <span class="key">Space</span>  toggle auto-play
 <span class="key">z</span>  claim dim as z (grid), scroll through next dim
 <span class="key">m</span>  cycle complex mode (mag/phase/real/imag)
+<span class="key">i</span>  show data info overlay
+<span class="key">f</span>  toggle centred FFT (prompts for axes)
 <span class="key">c</span>  cycle colormap
 <span class="key">d</span>  cycle dynamic range
 <span class="key">b</span>  toggle colorbar
@@ -675,7 +764,6 @@ def get_ui():
 <span class="key">s</span>  save screenshot (PNG)
 <span class="key">g</span>  save GIF of current slice dim
 <span class="key">+ / -</span>  zoom in / out
-<span class="key">scroll</span>  scroll through slices
 <span class="key">hover</span>  show pixel value
 <span class="key">?</span>  toggle this help</div>
     </div>
@@ -699,6 +787,7 @@ def get_ui():
 
         let shape = [];
         let dim_x = 0, dim_y = 1, current_slice_dim = 2;
+        let activeDim = 2;  // cursor dim: h/l move it, j/k act on it
         let indices = [];
         let colormap_idx = 0, dr_idx = 1;
         let isPlaying = false, playInterval = null;
@@ -723,11 +812,23 @@ def get_ui():
         // Toast state
         let toastTimer = null;
 
+        // Data-info state
+        let dataInfoTimer = null;
+
         // Zoom state
         let userZoom = 0.6;
 
         // Pixel hover throttle
         let pixelHoverPending = false;
+
+        // Flip state
+        let flip_x = false, flip_y = false;
+
+        // FFT state
+        let _fftActive = false;
+
+        // Log scale state
+        let logScale = false;
 
         const canvas = document.getElementById('viewer');
         const ctx = canvas.getContext('2d');
@@ -804,6 +905,35 @@ def get_ui():
             cbCtx.fillText(fmt(currentVmin), labelX, barY + barH);
         }
 
+        function showDataInfo(text) {
+            const el = document.getElementById('data-info');
+            el.textContent = text;
+            el.style.transition = 'none';
+            el.style.opacity = '1';
+            if (dataInfoTimer) clearTimeout(dataInfoTimer);
+            dataInfoTimer = setTimeout(() => {
+                el.style.transition = 'opacity 0.8s ease';
+                el.style.opacity = '0';
+            }, 4000);
+        }
+
+        function applyFlips(imageData, w, h) {
+            if (!flip_x && !flip_y) return imageData;
+            const src = imageData.data;
+            const out = new Uint8ClampedArray(src.length);
+            for (let row = 0; row < h; row++) {
+                const srcRow = flip_y ? (h - 1 - row) : row;
+                for (let col = 0; col < w; col++) {
+                    const srcCol = flip_x ? (w - 1 - col) : col;
+                    const si = (srcRow * w + srcCol) * 4;
+                    const di = (row * w + col) * 4;
+                    out[di] = src[si]; out[di+1] = src[si+1];
+                    out[di+2] = src[si+2]; out[di+3] = src[si+3];
+                }
+            }
+            return new ImageData(out, w, h);
+        }
+
         function initWebSocket() {
             const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(`${proto}//${location.host}/ws`);
@@ -836,7 +966,7 @@ def get_ui():
                 lastImgW = width; lastImgH = height;
                 canvas.width  = width;
                 canvas.height = height;
-                ctx.putImageData(lastImageData, 0, 0);
+                ctx.putImageData(applyFlips(lastImageData, width, height), 0, 0);
                 scaleCanvas(width, height);
             };
 
@@ -861,6 +991,7 @@ def get_ui():
                     colormap: COLORMAPS[colormap_idx],
                     dr: dr_idx,
                     complex_mode: complexMode,
+                    log_scale: logScale,
                     slice_dim: current_slice_dim,
                 })
             });
@@ -892,6 +1023,7 @@ def get_ui():
             indices = shape.map(s => Math.floor(s / 2));
             dim_x = 0; dim_y = 1;
             current_slice_dim = shape.length > 2 ? 2 : 0;
+            activeDim = current_slice_dim;
             initWebSocket();  // calls updateView() on open
             triggerPreload();
         }
@@ -902,17 +1034,25 @@ def get_ui():
 
         function renderInfo() {
             const idxStr = indices.map((v, i) => {
-                if (i === dim_x) return 'x';
-                if (i === dim_y) return 'y';
-                if (i === dim_z) return 'z';
-                if (i === current_slice_dim) return `<span class="highlight">[${v}]</span>`;
-                return v;
+                const active = (i === activeDim);
+                if (i === dim_x) {
+                    const inner = (flip_x ? '<span class="muted">-</span>' : '') + 'x';
+                    return active ? `<span class="highlight">${inner}</span>` : inner;
+                }
+                if (i === dim_y) {
+                    const inner = (flip_y ? '<span class="muted">-</span>' : '') + 'y';
+                    return active ? `<span class="highlight">${inner}</span>` : inner;
+                }
+                if (i === dim_z) return active ? `<span class="highlight">z</span>` : 'z';
+                return active ? `<span class="highlight">[${v}]</span>` : `${v}`;
             }).join(', ');
-            let text = `Shape: [${shape.join(', ')}]\\n`;
-            text += `Index: [${idxStr}]`;
+            let text = `[${idxStr}]`;
             if (isComplex || complexMode !== 0)
                 text += `  <span class="muted">${getModeLabel()}</span>`;
-            text += `  <span class="muted">(? for help)</span>`;
+            if (logScale)
+                text += `  <span class="muted">log</span>`;
+            if (_fftActive)
+                text += `  <span class="muted">FFT</span>`;
             document.getElementById('info').innerHTML = text;
         }
 
@@ -929,6 +1069,7 @@ def get_ui():
                 colormap: COLORMAPS[colormap_idx],
                 dr: dr_idx,
                 complex_mode: complexMode,
+                log_scale: logScale,
                 slice_dim: current_slice_dim,
                 direction: lastDirection,
             }));
@@ -1011,7 +1152,10 @@ def get_ui():
             e.preventDefault();            // stop browser default (e.g. textarea scrolling)
             e.stopImmediatePropagation();  // stop other handlers
             if (e.key === '?') { helpOverlay.classList.toggle('visible'); return; }
-            if (e.key === 'Escape') { helpOverlay.classList.remove('visible'); return; }
+            if (e.key === 'Escape') {
+                helpOverlay.classList.remove('visible');
+                return;
+            }
             if (e.key === '+' || e.key === '=') {
                 userZoom = Math.min(userZoom * 1.02, 8.0);
                 scaleCanvas(canvas.width, canvas.height);
@@ -1037,6 +1181,7 @@ def get_ui():
                     do { current_slice_dim = (current_slice_dim + 1) % shape.length; }
                     while (current_slice_dim === dim_x || current_slice_dim === dim_y || current_slice_dim === dim_z);
                 }
+                activeDim = current_slice_dim;
                 updateView(); triggerPreload();
             } else if (e.key === ' ') {
                 e.preventDefault();
@@ -1063,36 +1208,103 @@ def get_ui():
                 showToast(`range: ${DR_LABELS[dr_idx]}`);
             } else if (e.key === 'j' || e.key === 'ArrowDown') {
                 e.preventDefault();
-                lastDirection = -1; indices[current_slice_dim] = Math.max(0, indices[current_slice_dim] - 1); updateView();
+                if (activeDim === dim_x) {
+                    flip_x = !flip_x;
+                    if (lastImageData) ctx.putImageData(applyFlips(lastImageData, lastImgW, lastImgH), 0, 0);
+                    renderInfo();
+                } else if (activeDim === dim_y) {
+                    flip_y = !flip_y;
+                    if (lastImageData) ctx.putImageData(applyFlips(lastImageData, lastImgW, lastImgH), 0, 0);
+                    renderInfo();
+                } else {
+                    lastDirection = -1;
+                    indices[activeDim] = Math.max(0, indices[activeDim] - 1);
+                    updateView();
+                }
             } else if (e.key === 'k' || e.key === 'ArrowUp') {
                 e.preventDefault();
-                lastDirection = 1; indices[current_slice_dim] = Math.min(shape[current_slice_dim] - 1, indices[current_slice_dim] + 1); updateView();
+                if (activeDim === dim_x) {
+                    flip_x = !flip_x;
+                    if (lastImageData) ctx.putImageData(applyFlips(lastImageData, lastImgW, lastImgH), 0, 0);
+                    renderInfo();
+                } else if (activeDim === dim_y) {
+                    flip_y = !flip_y;
+                    if (lastImageData) ctx.putImageData(applyFlips(lastImageData, lastImgW, lastImgH), 0, 0);
+                    renderInfo();
+                } else {
+                    lastDirection = 1;
+                    indices[activeDim] = Math.min(shape[activeDim] - 1, indices[activeDim] + 1);
+                    updateView();
+                }
             } else if (e.key === 'h' || e.key === 'ArrowLeft') {
                 e.preventDefault();
-                const minFree = dim_z >= 0 ? 3 : 2;
-                do { current_slice_dim = (current_slice_dim - 1 + shape.length) % shape.length; }
-                while ((current_slice_dim === dim_x || current_slice_dim === dim_y || current_slice_dim === dim_z) && shape.length > minFree);
-                updateView(); triggerPreload();
+                activeDim = (activeDim - 1 + shape.length) % shape.length;
+                if (activeDim !== dim_x && activeDim !== dim_y && activeDim !== dim_z) {
+                    current_slice_dim = activeDim; triggerPreload();
+                }
+                renderInfo();
             } else if (e.key === 'l' || e.key === 'ArrowRight') {
                 e.preventDefault();
-                const minFree = dim_z >= 0 ? 3 : 2;
-                do { current_slice_dim = (current_slice_dim + 1) % shape.length; }
-                while ((current_slice_dim === dim_x || current_slice_dim === dim_y || current_slice_dim === dim_z) && shape.length > minFree);
-                updateView(); triggerPreload();
+                activeDim = (activeDim + 1) % shape.length;
+                if (activeDim !== dim_x && activeDim !== dim_y && activeDim !== dim_z) {
+                    current_slice_dim = activeDim; triggerPreload();
+                }
+                renderInfo();
+            } else if (e.key === 'L') {
+                logScale = !logScale;
+                fetch('/clearcache'); updateView(); triggerPreload();
+                showToast(logScale ? 'log scale: on' : 'log scale: off');
+            } else if (e.key === 'i') {
+                fetch('/info').then(r => r.json()).then(d => {
+                    const lines = [
+                        `Shape:    [${d.shape.join(', ')}]`,
+                        `Dtype:    ${d.dtype}`,
+                        `Elements: ${d.total_elements.toLocaleString()}`,
+                        `Size:     ${d.size_mb !== null ? d.size_mb + ' MB' : 'unknown'}`,
+                    ];
+                    if (d.filepath) lines.push(`File:     ${d.filepath}`);
+                    if (d.fft_axes) lines.push(`FFT axes: [${d.fft_axes.join(', ')}]`);
+                    showDataInfo(lines.join('\\n'));
+                });
+            } else if (e.key === 'f') {
+                if (_fftActive) {
+                    fetch('/fft', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({axes: ''})})
+                        .then(r => r.json()).then(d => {
+                            _fftActive = false;
+                            isComplex = d.is_complex || false;
+                            if (!isComplex && complexMode >= REAL_MODES.length) complexMode = 0;
+                            updateView(); triggerPreload();
+                            showToast('FFT: off');
+                        });
+                } else {
+                    const axesStr = window.prompt('FFT axes (comma-separated, e.g. 0,1):', '0,1');
+                    if (!axesStr) return;
+                    fetch('/fft', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({axes: axesStr})})
+                        .then(r => r.json()).then(d => {
+                            if (d.error) { showToast('FFT error: ' + d.error); return; }
+                            _fftActive = true;
+                            isComplex = d.is_complex || false;
+                            complexMode = 0;
+                            updateView(); triggerPreload();
+                            showToast(`FFT: [${d.axes.join(',')}]`);
+                        });
+                }
             } else if (e.key === 'x') {
                 if (shape.length < 3) return;
                 [dim_x, current_slice_dim] = [current_slice_dim, dim_x];
-                dim_z = -1;
+                activeDim = current_slice_dim; dim_z = -1;
                 updateView(); triggerPreload();
             } else if (e.key === 'y') {
                 if (shape.length < 3) return;
                 [dim_y, current_slice_dim] = [current_slice_dim, dim_y];
-                dim_z = -1;
+                activeDim = current_slice_dim; dim_z = -1;
                 updateView(); triggerPreload();
             }
         });
 
         helpOverlay.addEventListener('click', () => { helpOverlay.classList.remove('visible'); sink.focus(); });
+
+        document.getElementById('help-hint').addEventListener('click', () => { helpOverlay.classList.toggle('visible'); sink.focus(); });
 
         window.addEventListener('wheel', (e) => {
             e.preventDefault();
@@ -1153,9 +1365,14 @@ async def _serve_background(port: int):
 
 def _set_data(data):
     """Update the global DATA/SHAPE and flush all caches."""
-    global DATA, SHAPE
+    global DATA, SHAPE, _data_filepath, _fft_original_data, _fft_axes
     if isinstance(data, str):
+        _data_filepath = data
         data = load_data(data)
+    else:
+        _data_filepath = None
+    _fft_original_data = None
+    _fft_axes = None
     DATA = data
     SHAPE = data.shape
     _raw_cache.clear()
@@ -1222,7 +1439,7 @@ def view(data, port: int = 8123, inline: bool | None = None, height: int = 500):
 
 
 def main():
-    global DATA, SHAPE
+    global DATA, SHAPE, _data_filepath
 
     parser = argparse.ArgumentParser(description="Lightning Fast ND Array Viewer")
     parser.add_argument("file", help="Path to .npy, .nii/.nii.gz, or .zarr file")
@@ -1232,6 +1449,7 @@ def main():
     try:
         DATA = load_data(args.file)
         SHAPE = DATA.shape
+        _data_filepath = args.file
         try:
             size_str = f" ({DATA.nbytes // 1024**2} MB)"
         except AttributeError:
